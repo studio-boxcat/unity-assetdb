@@ -1,13 +1,14 @@
-//! On-disk schemas for the bake-asset-db pipeline.
+//! On-disk schemas for the bake pipeline.
 //!
-//! Two files live in `<project>/Library/pspec/`:
+//! Two files, written side-by-side under the consumer-chosen out-dir
+//! (commonly `<project>/Library/<consumer>/`):
 //!
 //! - `asset-db.bin` — convert artifact. Lean: per-entry guid, asset type,
-//!   alias, sub-assets. Sorted by guid for O(log n) binary-search lookup;
+//!   name, sub-assets. Sorted by guid for O(log n) binary-search lookup;
 //!   no path/mtime baggage.
 //! - `asset-db.cache.bin` — bake-only cache, gitignored alongside.
 //!   Maps `hint → (mtimes, resolved bake state)` so unchanged assets skip
-//!   re-parsing on subsequent bakes. Convert never reads this.
+//!   re-parsing on subsequent bakes. Downstream consumers never read this.
 //!
 //! Script (MonoBehaviour / ScriptableObject) types are interned in
 //! `script_types` and referenced by index — keeps per-entry payload small
@@ -24,17 +25,20 @@ use crate::class_id::ClassId;
 /// A version mismatch is a hard fail — the user re-bakes.
 ///
 /// History:
-/// - v4: every alias in `entries[].name` and `entries[].sub_assets[].name`
-///   resolves to a unique guid (alias namespace unified across top-level
+/// - v4: every name in `entries[].name` and `entries[].sub_assets[].name`
+///   resolves to a unique guid (name namespace unified across top-level
 ///   and sub-asset rows). Pre-v4 bakes could carry colliding sub-asset
-///   names; convert no longer accepts them.
-pub const SCHEMA_VERSION: u16 = 4;
+///   names; readers no longer accept them.
+/// - v5: file magic renamed `PSPECADB` → `UADBIN__` and `PSPECABC` →
+///   `UADCACHE` to drop the historical "pspec" prefix. Pre-v5 bakes
+///   are unreadable; re-bake required after upgrading from a v4 pspec.
+pub const SCHEMA_VERSION: u16 = 5;
 
-/// File magic — first 8 bytes. `b"PSPECADB"`.
-pub const MAGIC: [u8; 8] = *b"PSPECADB";
+/// File magic — first 8 bytes. `b"UADBIN__"`.
+pub const MAGIC: [u8; 8] = *b"UADBIN__";
 
 /// File magic for the bake-only cache file.
-pub const CACHE_MAGIC: [u8; 8] = *b"PSPECABC";
+pub const CACHE_MAGIC: [u8; 8] = *b"UADCACHE";
 
 /// Type of a Unity asset.
 ///
@@ -189,7 +193,7 @@ pub const DB_FILENAME: &str = "asset-db.bin";
 pub const CACHE_FILENAME: &str = "asset-db.cache.bin";
 
 /// `<dir>/asset-db.bin`. Caller composes the directory convention
-/// (e.g. `<project>/Library/pspec/`, `<project>/Library/unity-assetdb/`).
+/// (e.g. `<project>/Library/unity-assetdb/`).
 pub fn db_path(dir: &Path) -> PathBuf {
     dir.join(DB_FILENAME)
 }

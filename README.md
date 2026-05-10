@@ -5,9 +5,9 @@ compact bincode index that maps asset GUIDs (and sub-asset fileIDs) to human-rea
 names. Designed for tooling that needs to reason about Unity assets by name without
 loading the editor.
 
-Originally extracted from [pspec](https://github.com/—/pspec) (Unity prefab YAML ↔ JSON
-converter). Reusable by any tool that wants the same GUID→name index — e.g. a
-Rust-side asset-catalog baker for the Unity client.
+Originally extracted from a Unity prefab YAML ↔ JSON converter. Reusable by
+any tool that wants the same GUID→name index — e.g. a Rust-side
+asset-catalog baker for the Unity client.
 
 ## Crate layout
 

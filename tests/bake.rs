@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use unity_assetdb::bake::{BakeOptions, bake};
 use unity_assetdb::store;
 
-/// Mirrors pspec's old `bake_action(Some(&root), None)` for the test
-/// suite — drives the new `BakeOptions` API with the canonical
+/// Drives the `BakeOptions` API with the canonical
 /// `<root>/Library/unity-assetdb/` out dir, no sanitizer, silent sinks.
 fn bake_at(root: &Path) -> PathBuf {
     let out_dir = out_dir_for(root);
@@ -98,7 +97,7 @@ fn unique_tmp(label: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("pspec-bake-test-{label}-{pid}-{nanos}"))
+    std::env::temp_dir().join(format!("unity-assetdb-bake-test-{label}-{pid}-{nanos}"))
 }
 
 #[test]

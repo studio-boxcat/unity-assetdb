@@ -1,4 +1,4 @@
-//! `pspec bake-asset-db` orchestrator: walk → parse → cache → write.
+//! Bake orchestrator: walk → parse → cache → write.
 //!
 //! Per-file flow:
 //! 1. Stat `.meta` and the companion asset file. If both mtimes match the
@@ -204,8 +204,8 @@ pub struct BakeOptions {
     /// before constructing options.
     pub project_root: PathBuf,
     /// Directory where `asset-db.bin` and `asset-db.cache.bin` are written.
-    /// Caller composes the convention (e.g. `<project>/Library/pspec/`,
-    /// `<project>/Library/unity-assetdb/`, or a fixture-staging path).
+    /// Caller composes the convention (e.g. `<project>/Library/unity-assetdb/`
+    /// or a fixture-staging path).
     pub out_dir: PathBuf,
     /// Optional name sanitizer; see [`NameSanitizer`].
     pub name_sanitizer: Option<NameSanitizer>,
@@ -215,12 +215,12 @@ pub struct BakeOptions {
     /// summary line.
     pub on_progress: Option<ProgressSink>,
     /// When true, [`on_progress`] also receives a per-phase timing line
-    /// (cache / walk / build / write). Replaces pspec's `PSPEC_BAKE_TIMING`
-    /// env var — env-var-driven behavior is the consumer's call.
+    /// (cache / walk / build / write). Env-var-driven behavior is the
+    /// consumer's call.
     pub verbose_timing: bool,
     /// When true, [`on_warn`] receives a line for each name-collision
-    /// rewrite during dedup. Replaces pspec's `PSPEC_BAKE_VERBOSE` env
-    /// var. Off by default to keep steady-state warm bakes quiet.
+    /// rewrite during dedup. Off by default to keep steady-state warm
+    /// bakes quiet.
     pub verbose_collisions: bool,
 }
 

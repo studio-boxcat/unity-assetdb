@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn rejects_non_project() {
-        let tmp = std::env::temp_dir().join(format!("pspec-walk-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("unity-assetdb-walk-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let result = resolve_project_root(Some(&tmp));
         assert!(result.is_err());
