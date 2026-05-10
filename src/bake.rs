@@ -52,6 +52,13 @@ pub type WarnSink = Box<dyn Fn(&str) + Send + Sync + 'static>;
 /// "info" output and warnings to different places.
 pub type ProgressSink = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
+/// Borrowed view of a [`NameSanitizer`] for internal helpers. Kept as a
+/// named type so per-call signatures don't trip clippy's `type_complexity`.
+type NameSanitizerRef<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
+
+/// Borrowed view of a [`WarnSink`]. See [`NameSanitizerRef`].
+type WarnSinkRef<'a> = &'a (dyn Fn(&str) + Send + Sync);
+
 /// Convert `SystemTime` → ns-since-UNIX. Saturates to 0 on pre-epoch
 /// (which would only happen if the user's clock is bogus).
 fn mtime_ns(t: SystemTime) -> u64 {
@@ -222,22 +229,6 @@ pub struct BakeOptions {
     /// rewrite during dedup. Off by default to keep steady-state warm
     /// bakes quiet.
     pub verbose_collisions: bool,
-}
-
-impl BakeOptions {
-    /// Minimal options: project root + out dir. All sinks `None`,
-    /// no sanitizer, verbose flags off.
-    pub fn new(project_root: PathBuf, out_dir: PathBuf) -> Self {
-        Self {
-            project_root,
-            out_dir,
-            name_sanitizer: None,
-            on_warn: None,
-            on_progress: None,
-            verbose_timing: false,
-            verbose_collisions: false,
-        }
-    }
 }
 
 /// Bake entry-point. Walks `Assets/`, parses `.meta` + asset YAML,
@@ -536,7 +527,7 @@ fn synthesize_implicit_sprite(meta: &meta::MetaInfo, stem: &str) -> Option<SubAs
     }
 }
 
-fn warn_sanitized(on_warn: Option<&(dyn Fn(&str) + Send + Sync)>, kind: &str, hint: &str, old: &str, new: &str) {
+fn warn_sanitized(on_warn: Option<WarnSinkRef<'_>>, kind: &str, hint: &str, old: &str, new: &str) {
     if let Some(sink) = on_warn {
         sink(&format!(
             "warning: {kind} {hint} name `{old}` contains ref-reserved char; renamed to `{new}`",
@@ -546,8 +537,8 @@ fn warn_sanitized(on_warn: Option<&(dyn Fn(&str) + Send + Sync)>, kind: &str, hi
 
 fn build_db(
     mut raw: Vec<RawEntry>,
-    sanitizer: Option<&(dyn Fn(&str) -> Option<String> + Send + Sync)>,
-    on_warn: Option<&(dyn Fn(&str) + Send + Sync)>,
+    sanitizer: Option<NameSanitizerRef<'_>>,
+    on_warn: Option<WarnSinkRef<'_>>,
     verbose_collisions: bool,
 ) -> Result<AssetDb> {
     // Stable order: sort by hint so dedup picks the same "winner" each bake.
@@ -577,7 +568,6 @@ fn build_db(
         }
     }
 
-    let verbose = verbose_collisions;
 
     // Pass 1: tally every name's distinct-guid owners across both
     // top-level and sub-asset claims. A name owned by ≥2 distinct guids
@@ -607,7 +597,7 @@ fn build_db(
     for r in raw.iter_mut() {
         if contested(&r.name) {
             let new_name = disambiguate(&r.name, &r.hint, r.guid, &taken)?;
-            if verbose && let Some(sink) = on_warn {
+            if verbose_collisions && let Some(sink) = on_warn {
                 sink(&format!(
                     "warning: name collision on `{}` (guid {:032x}); renamed to `{}`",
                     r.name, r.guid, new_name,
@@ -631,7 +621,7 @@ fn build_db(
             if contested(&sub.name) {
                 let original = sub.name.to_string();
                 let new_name = disambiguate(&original, &r.hint, r.guid, &taken)?;
-                if verbose && let Some(sink) = on_warn {
+                if verbose_collisions && let Some(sink) = on_warn {
                     sink(&format!(
                         "warning: sub-asset name collision on `{}` (parent guid {:032x}); renamed to `{}`",
                         original, r.guid, new_name,

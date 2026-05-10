@@ -32,4 +32,3 @@ are found. Without `--out-dir`, writes to `<project>/Library/unity-assetdb/`.
 - **API stability:** pre-1.0; signatures may shift.
 - **Errors:** internal `anyhow::Result` everywhere. Public API will move to
   `thiserror` types before 1.0.
-- **Distribution:** path-dep only; no git remote / crates.io publish yet.
