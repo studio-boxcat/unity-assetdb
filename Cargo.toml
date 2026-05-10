@@ -1,0 +1,28 @@
+[package]
+name = "unity-assetdb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Unity asset GUID → name index baker. Walks `Assets/`, parses `.meta` and asset YAML, writes a compact bincode database."
+# repository = "..."   # add when remote exists
+
+[lib]
+name = "unity_assetdb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unity-assetdb"
+path = "src/bin/unity-assetdb.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[dependencies]
+ahash = "0.8"
+anyhow = "1"
+bincode = "2"
+ignore = "0.4"
+clap = { version = "4", features = ["derive"], optional = true }
