@@ -179,7 +179,17 @@ pub enum CachedAssetType {
 }
 
 /// One cached parse result, keyed by `hint`. Lets a re-bake skip the
-/// .meta + asset reads when both mtimes match.
+/// .meta + asset reads when the meta mtime matches.
+///
+/// `asset_mtime_ns` is recorded but no longer participates in the warm
+/// fast-path invalidation check — `process_one` keys solely on
+/// `meta_mtime_ns`. The field is retained for forensic value (a future
+/// re-bake or external tooling can compare against the live asset
+/// mtime) and as a schema slot for richer invalidation logic should it
+/// land. The implication: under hand-edits that touch the asset
+/// without touching the .meta, this field can become stale on the
+/// next re-bake (still serves the cached row). See
+/// `tests/bake.rs::cache_does_not_detect_asset_only_touch`.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CachedEntry {
     pub hint: Box<str>,

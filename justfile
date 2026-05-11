@@ -3,7 +3,7 @@
 BIN := "target/release/unity-assetdb"
 
 # Default Unity project for the profile recipes — meow-tower. Override on the
-# command line: `just MEOW_CLIENT=/path/to/other/project profile-warm`.
+# command line: `just MEOW_CLIENT=/path/to/other/project profile`.
 MEOW_CLIENT := env_var_or_default("MEOW_CLIENT", "/Users/jameskim/Develop/meow-tower")
 
 # Out dir for the bake during profiling — kept off-tree so iterating doesn't
