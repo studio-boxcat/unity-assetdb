@@ -52,36 +52,14 @@ pub fn parse(text: &str) -> Result<MetaInfo> {
     let mut cur_id: Option<i64> = None;
 
     for line in text.lines() {
-        // sprites-block handling has to come first — the block lives at a
-        // deeper indent than the key scans below, and an early `continue`
-        // here keeps the simple key scans from accidentally matching e.g.
-        // a sub-`name:` inside a sprite entry as a top-level field.
-        if in_sprites {
-            let trimmed = line.trim();
-            // Block ends when indent drops to root (sibling key with no
-            // leading whitespace). Empty lines are tolerated.
-            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-                in_sprites = false;
-                flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
-                // Fall through — this line may itself be a key we want
-                // (textureType / spriteMode appear after spriteSheet in
-                // some importer versions).
-            } else if let Some(after_dash) = trimmed.strip_prefix("- ") {
-                // New list item — flush the previous and start a new one
-                // with whatever k:v rides on the dash line.
-                flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
-                absorb_kv(after_dash, &mut cur_name, &mut cur_id);
-                continue;
-            } else {
-                absorb_kv(trimmed, &mut cur_name, &mut cur_id);
-                continue;
-            }
-        }
+        let trimmed_left = line.trim_start();
 
-        let trimmed = line.trim_start();
-
+        // Top-level key scans — INDEPENDENT of `in_sprites` state. Each
+        // matches only when the line (after left-trim) starts with the
+        // key, so a `- name: textureType: …` sprite entry can't false-
+        // match (it starts with `- `, not `textureType:`).
         if !have_guid
-            && let Some(rest) = trimmed.strip_prefix("guid:")
+            && let Some(rest) = trimmed_left.strip_prefix("guid:")
         {
             let hex = rest.trim();
             if hex.len() == 32
@@ -90,20 +68,37 @@ pub fn parse(text: &str) -> Result<MetaInfo> {
                 info.guid = g;
                 have_guid = true;
             }
-            continue;
+        } else if info.texture_type.is_none()
+            && let Some(rest) = trimmed_left.strip_prefix("textureType:")
+        {
+            info.texture_type = rest.trim().parse().ok();
+        } else if info.sprite_mode.is_none()
+            && let Some(rest) = trimmed_left.strip_prefix("spriteMode:")
+        {
+            info.sprite_mode = rest.trim().parse().ok();
         }
 
-        if let Some(rest) = trimmed.strip_prefix("textureType:") {
-            info.texture_type = rest.trim().parse().ok();
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("spriteMode:") {
-            info.sprite_mode = rest.trim().parse().ok();
-            continue;
-        }
-        if trimmed == "sprites:" {
+        // SpriteSheet sub-list — separate state machine. Top-level keys
+        // above (textureType/spriteMode) sit at SHALLOWER indent than
+        // sprite-entry contents in Unity's output, but we don't rely on
+        // that here: the entry parser only matches `- ` list openers and
+        // `name:` / `internalID:` lines, neither of which collides with
+        // the top-level scans above.
+        if in_sprites {
+            let trimmed = line.trim();
+            // Block ends when indent drops to root (sibling key with no
+            // leading whitespace). Empty lines are tolerated.
+            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
+                in_sprites = false;
+                flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
+            } else if let Some(after_dash) = trimmed.strip_prefix("- ") {
+                flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
+                absorb_kv(after_dash, &mut cur_name, &mut cur_id);
+            } else {
+                absorb_kv(trimmed, &mut cur_name, &mut cur_id);
+            }
+        } else if trimmed_left == "sprites:" {
             in_sprites = true;
-            continue;
         }
     }
 
@@ -199,5 +194,76 @@ TextureImporter:
         let info = parse(text).unwrap();
         assert_eq!(info.texture_type, None);
         assert_eq!(info.sprite_mode, None);
+    }
+
+    /// Single-pass parser correctness: a `name:` key sitting INSIDE the
+    /// `sprites:` block must NOT leak out and pollute any top-level key
+    /// match (e.g. an erroneous `guid:` parse off a sub-entry's `name:`).
+    /// Regression for cross-block bleed-through — the kind of bug
+    /// single-pass parsers fail at when they share state inappropriately.
+    #[test]
+    fn sprites_block_inner_keys_dont_leak_to_top_level() {
+        let text = "fileFormatVersion: 2
+guid: aabbccddaabbccddaabbccddaabbccdd
+TextureImporter:
+  spriteSheet:
+    sprites:
+    - name: textureType: 99
+      internalID: 12345
+  textureType: 8
+  spriteMode: 2
+";
+        let info = parse(text).unwrap();
+        // sub-entry's `name:` is a sprite name, NOT the importer's
+        // textureType (which is 8 below the block, not 99 inside).
+        assert_eq!(info.texture_type, Some(8));
+        assert_eq!(info.sprite_mode, Some(2));
+        assert_eq!(info.sprite_sheet.len(), 1);
+        assert_eq!(info.sprite_sheet[0].0, 12345);
+    }
+
+    /// Key order independence: pre-2022 .meta files sometimes emit
+    /// `textureType` BEFORE `spriteSheet:` rather than after. The
+    /// single-pass scanner must pick both up regardless of order.
+    #[test]
+    fn key_order_independence() {
+        let text = "fileFormatVersion: 2
+guid: aabbccddaabbccddaabbccddaabbccdd
+TextureImporter:
+  textureType: 8
+  spriteMode: 1
+  spriteSheet:
+    sprites: []
+  externalObjects: {}
+";
+        let info = parse(text).unwrap();
+        assert_eq!(info.texture_type, Some(8));
+        assert_eq!(info.sprite_mode, Some(1));
+        assert!(info.sprite_sheet.is_empty());
+    }
+
+    /// CRLF line endings (Unity-on-Windows project, occasional cross-OS
+    /// fixture). `str::lines` already handles both \n and \r\n; pin that
+    /// our key strip-prefix matches don't accidentally include a trailing
+    /// \r in the value parse.
+    #[test]
+    fn crlf_line_endings() {
+        let text = "fileFormatVersion: 2\r\nguid: 7d602c2080b53413fa393df6b2c0af43\r\nTextureImporter:\r\n  textureType: 8\r\n  spriteMode: 1\r\n";
+        let info = parse(text).unwrap();
+        assert_eq!(info.guid, 0x7d602c2080b53413fa393df6b2c0af43_u128);
+        assert_eq!(info.texture_type, Some(8));
+        assert_eq!(info.sprite_mode, Some(1));
+    }
+
+    /// Empty file → clean error (not a panic). `process_one` catches
+    /// the parse error and surfaces it as a worker error; this test
+    /// pins the boundary so the `?` propagation stays valid.
+    #[test]
+    fn empty_file_errors_cleanly() {
+        let err = parse("").unwrap_err();
+        // `{:#}` flattens the anyhow context chain so the inner
+        // "missing guid" message surfaces alongside the outer context.
+        let msg = format!("{err:#}");
+        assert!(msg.contains("guid"), "expected guid-missing error, got: {msg}");
     }
 }

@@ -423,4 +423,85 @@ mod tests {
         let db_bytes = encode(&db).unwrap();
         assert!(decode_cache(&db_bytes).is_err());
     }
+
+    /// Schema version is bumped on every breaking layout change. A
+    /// downgrade-shaped payload (correct magic but lower version)
+    /// must hard-fail decoding so the bake re-parses from scratch
+    /// rather than serving structurally wrong sub-asset rows.
+    #[test]
+    fn schema_version_downgrade_hard_fails() {
+        let mut db = AssetDb::new();
+        db.schema_version = SCHEMA_VERSION.saturating_sub(1);
+        let bytes = encode(&db).unwrap();
+        let err = decode(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("schema") && err.contains("re-bake"),
+            "expected schema-version error, got: {err}",
+        );
+    }
+
+    /// Schema version upgrades (an envelope from a *newer* unity-assetdb
+    /// build) also hard-fail — consumer can't safely interpret
+    /// fields it doesn't know about. Same error path as downgrades.
+    #[test]
+    fn schema_version_upgrade_hard_fails() {
+        let mut db = AssetDb::new();
+        db.schema_version = SCHEMA_VERSION + 1;
+        let bytes = encode(&db).unwrap();
+        let err = decode(&bytes).unwrap_err().to_string();
+        assert!(err.contains("schema"), "expected schema-version error, got: {err}");
+    }
+
+    /// Cache schema mismatch is detected the same way — a v5 cache
+    /// against a v6 reader must trip the error path so the bake
+    /// rebuilds the cache from scratch instead of serving stale rows.
+    #[test]
+    fn cache_schema_version_mismatch_hard_fails() {
+        let mut c = BakeCache::new();
+        c.schema_version = SCHEMA_VERSION.saturating_sub(1);
+        let bytes = encode_cache(&c).unwrap();
+        let err = decode_cache(&bytes).unwrap_err().to_string();
+        assert!(err.contains("schema"), "expected schema mismatch, got: {err}");
+    }
+
+    /// `SubAsset.class_id` is a v5+ field. Pin that a round-trip
+    /// through the encoder preserves it — the read path uses this
+    /// value as the discriminator for sub-asset namespacing rules,
+    /// so silent truncation would be a hard-to-spot correctness bug.
+    #[test]
+    fn subasset_class_id_round_trips() {
+        let mut db = AssetDb::new();
+        db.entries.push(AssetEntry {
+            guid: 0xa0_u128,
+            asset_type: AssetType::native(ClassId::AnimatorController),
+            name: "Foo".into(),
+            sub_assets: vec![
+                SubAsset {
+                    file_id: 9100000,
+                    class_id: ClassId::AnimatorController as u32,
+                    name: "Foo_self".into(),
+                },
+                SubAsset {
+                    file_id: -123456789,
+                    class_id: 1102, // AnimatorState
+                    name: "Idle".into(),
+                },
+            ],
+            hint: "Assets/Foo.controller".into(),
+        });
+        db.sort();
+
+        let bytes = encode(&db).unwrap();
+        let back = decode(&bytes).unwrap();
+        let entry = back.find_by_guid(0xa0_u128).unwrap();
+        assert_eq!(entry.sub_assets.len(), 2);
+        let self_sub = entry
+            .sub_assets
+            .iter()
+            .find(|s| &*s.name == "Foo_self")
+            .unwrap();
+        assert_eq!(self_sub.class_id, ClassId::AnimatorController as u32);
+        let idle = entry.sub_assets.iter().find(|s| &*s.name == "Idle").unwrap();
+        assert_eq!(idle.class_id, 1102);
+    }
 }
