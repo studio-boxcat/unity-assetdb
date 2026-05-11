@@ -76,6 +76,32 @@ cold:  walked=20560 hit=0 parsed=18169
        (OS cache cold; warm-OS rerun after this writes ~400ms)
 ```
 
+### Query + register subcommands
+
+Captured 2026-05-12, same hardware. Hyperfine 10-run means, `--warmup 2`,
+release binary, stdout redirected to `/dev/null`. Against the warm bake
+above (18,169-entry `asset-db.bin`).
+
+| Subcommand | Mean | σ | What it does |
+|---|---:|---:|---|
+| `path <guid>` | 4.6 ms | 0.2 | bin load + binary-search by guid |
+| `alias <name>` (hit) | 4.5 ms | 0.2 | bin load + linear scan on name |
+| `guid <path>` (hit) | 4.8 ms | 0.2 | bin load + linear scan on hint |
+| `alias <name>` (miss + fuzzy) | 6.5 ms | 0.5 | bin load + ASCII Levenshtein over names |
+| `find <pattern>` | 6.2 ms | 0.3 | bin load + ASCII case-insensitive substring scan |
+| `list --type Sprite` | 10.4 ms | 0.5 | bin load + filter + emit 1,041 rows |
+| `list` (full emit) | 16.8 ms | 0.4 | bin load + emit all 18,169 rows |
+| `register` (idempotent) | 6.8 ms | 0.4 | bin load + parse existing meta + diff |
+| `register` (fresh asset) | 10.9 ms | 1.1 | bin load + synthesize meta + insert row + atomic write |
+
+Point lookups (`path`/`alias`/`guid`) are bin-load-bound (~4.5 ms is
+`bincode::decode_from_slice` over 2.1 MB). `list` full-emit at 16.8 ms is
+dominated by 18 k `writeln!` calls; `find` and fuzzy-`alias` ride the
+ASCII byte-path optimizations in `query::find` and `suggest::ascii_*`
+(skip `to_lowercase` allocations on the hot loop). `register` fresh
+adds ~4 ms over idempotent for `getrandom` + `OpenOptions::create_new`
+meta write + bin/cache rewrite under the advisory flock.
+
 ### Optimization history
 
 | Change | Warm walk | Total warm |
