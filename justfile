@@ -17,6 +17,10 @@ default:
 build:
     cargo build --release
 
+# Install the CLI to ~/.cargo/bin (on PATH).
+install:
+    cargo install --path .
+
 # Run lib + integration tests.
 test:
     cargo test

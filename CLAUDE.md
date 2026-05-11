@@ -21,6 +21,7 @@ asset-catalog baker for the Unity client.
 ## CLI
 
 ```sh
+just install          # cargo install --path . → ~/.cargo/bin/unity-assetdb
 unity-assetdb bake [--project <path>] [--out-dir <path>]
 ```
 
