@@ -29,9 +29,17 @@ use crate::class_id::ClassId;
 ///   resolves to a unique guid (name namespace unified across top-level
 ///   and sub-asset rows). Pre-v4 bakes could carry colliding sub-asset
 ///   names; readers no longer accept them.
-/// - v5: file magic renamed `PSPECADB` → `UADBIN__` and `PSPECABC` →
-///   `UADCACHE` to drop the historical "pspec" prefix. Pre-v5 bakes
-///   are unreadable; re-bake required after upgrading from a v4 pspec.
+/// - v5: two changes shipped together.
+///   1. File magic renamed `PSPECADB` → `UADBIN__` and `PSPECABC` →
+///      `UADCACHE` to drop the historical "pspec" prefix.
+///   2. `SubAsset` carries `class_id` so non-canonical sub-asset fileIDs
+///      (prefab-embedded `AnimationClip` with hashed negative fids) keep
+///      their real Unity class instead of a `file_id / 100_000` heuristic
+///      collapsing them to `ScriptableObject`. Top-level entries also
+///      share their alias bucket with same-named entries of a different
+///      `asset_type` — type-aware reverse lookup discriminates at query
+///      time. See [Name collisions](docs/asset-database.md#name-collisions).
+///   Pre-v5 bakes are unreadable; re-bake required after upgrading.
 pub const SCHEMA_VERSION: u16 = 5;
 
 /// File magic — first 8 bytes. `b"UADBIN__"`.
@@ -60,14 +68,23 @@ impl AssetType {
 
 /// One sub-object inside an asset that has its own fileID.
 ///
-/// Sprite-atlas entries, multi-clip animations, sprite-sheet sub-sprites.
-/// Per-entry list is sorted by `file_id` for binary-search lookups.
+/// Sprite-atlas entries, multi-clip animations, sprite-sheet sub-sprites,
+/// prefab-embedded `AnimationClip` docs. Per-entry list is sorted by
+/// `file_id` for binary-search lookups.
+///
+/// `class_id` is the Unity native classID of the sub-doc (`74` for
+/// `AnimationClip`, `213` for `Sprite`, etc.). Stored explicitly because
+/// prefab-embedded sub-asset fileIDs are hashed (negative or non-multiple-
+/// of-100000) and a `file_id / 100_000` heuristic collapses them to
+/// `ScriptableObject` — the asset DB needs the real class for the
+/// strict-typed-field elision rule consumers apply downstream.
 ///
 /// `name` is `Box<str>` rather than `String` — strings here are immutable
 /// once decoded; dropping the capacity field saves 8 bytes per entry.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SubAsset {
     pub file_id: i64,
+    pub class_id: u32,
     pub name: Box<str>,
 }
 
@@ -328,6 +345,7 @@ mod tests {
             name: "Bar".into(),
             sub_assets: vec![SubAsset {
                 file_id: 21300000,
+                class_id: ClassId::Sprite as u32,
                 name: "Bar_sub".into(),
             }],
             hint: "Assets/Tween/Bar.asset".into(),

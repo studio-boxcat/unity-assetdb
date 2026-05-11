@@ -69,6 +69,10 @@ pub fn parse(text: &str, mode: ParseMode) -> Result<AssetInfo> {
             info.top_file_id = Some(d.file_id);
             info.script_guid = d.script_guid;
         } else {
+            // class_id is propagated through to `SubAsset` in store.rs —
+            // critical for prefab-embedded sub-docs whose hashed negative
+            // fileID can't be reverse-derived to a class via the
+            // `file_id = class * 100_000` heuristic.
             info.sub_assets.push(SubAssetEntry {
                 class_id: d.class_id,
                 file_id: d.file_id,

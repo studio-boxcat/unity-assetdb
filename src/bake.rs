@@ -80,7 +80,11 @@ struct RawEntry {
     sub_assets: Vec<SubAsset>,
 }
 
-#[derive(Clone, Copy)]
+/// Hashable type discriminator: `Native(classID)` for built-in classes
+/// and `Script(scriptGuid)` for MonoBehaviour-backed assets. Hashable so
+/// the dedup pass can bucket by `(name, asset_type)` without depending
+/// on the post-walk script-intern table.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum AssetTypeRaw {
     Native(u32),
     Script(u128),
@@ -416,21 +420,24 @@ fn process_one(
     let mut script_guid: Option<u128> = None;
 
     // YAML peek strategy:
-    //  - TopOnly: types whose extra docs are internal scene-graph (.prefab
-    //    GameObjects, .controller AnimatorStates, …) — read just enough to
-    //    capture top class ID + m_Script.guid, then bail.
-    //  - WithSubAssets: types where extra docs ARE addressable from outside
-    //    (.asset multi-doc, .spriteatlas packed sprites). Read fully.
+    //  - WithSubAssets: types where extra docs ARE addressable from outside.
+    //    `.asset`/`.spriteatlas`/`.spriteatlasv2` host explicit sub-assets;
+    //    `.prefab`/`.controller`/`.anim`/`.mixer`/`.playable` can host
+    //    embedded sub-asset docs (legacy `AnimationClip` inline in a
+    //    prefab; AnimatorState in a controller; AudioMixerGroup in a
+    //    mixer; Timeline tracks in a playable) that other prefabs
+    //    address as `{fileID, guid: <parent.guid>, type: 3}`. Without
+    //    capturing them the embedded ref encodes as `&#f<fid>` and
+    //    cross-prefab refs degrade to the parent alias + `#f<fid>` suffix.
+    //    Embeds are excluded from the global dedup pool — see
+    //    `is_embedded` in `build_db`.
+    //  - TopOnly: types whose extra docs are internal scene-graph that
+    //    isn't addressable from outside (`.unity`, `.mat`, `.mask`).
     //  - None: extension already says everything (`.png`, `.fbx`, scripts).
     let parse_mode: Option<asset::ParseMode> = match ext {
-        "asset" | "spriteatlas" | "spriteatlasv2" => Some(asset::ParseMode::WithSubAssets),
-        // `.playable` files are MonoBehaviour-backed (TimelineAsset and friends);
-        // the YAML peek captures the script guid so they land as `Script(...)`
-        // entries, the same path as `.asset` ScriptableObjects.
-        // `.mixer` is `AudioMixerController` (native classID 244, Editor-only).
-        "prefab" | "controller" | "anim" | "mat" | "mask" | "unity" | "playable" | "mixer" => {
-            Some(asset::ParseMode::TopOnly)
-        }
+        "asset" | "spriteatlas" | "spriteatlasv2" | "prefab" | "controller" | "anim"
+        | "mixer" | "playable" => Some(asset::ParseMode::WithSubAssets),
+        "mat" | "mask" | "unity" => Some(asset::ParseMode::TopOnly),
         _ => None,
     };
 
@@ -443,6 +450,7 @@ fn process_one(
             if !s.name.is_empty() {
                 sub_assets.push(SubAsset {
                     file_id: s.file_id,
+                    class_id: s.class_id,
                     name: s.name.into_boxed_str(),
                 });
             }
@@ -475,10 +483,13 @@ fn process_one(
     // `meta_info.sprite_sheet`, so the predicate must run before that.
     let implicit_sprite = synthesize_implicit_sprite(&meta_info, &name);
 
-    // Texture sprite-sheet sub-assets (from .meta).
+    // Texture sprite-sheet sub-assets (from .meta). Always class Sprite —
+    // .meta `sprites:` entries are by definition Sprite sub-assets of the
+    // texture (Unity's Sprite-mode importer creates them at fileID-as-hash).
     for (fid, name) in meta_info.sprite_sheet {
         sub_assets.push(SubAsset {
             file_id: fid,
+            class_id: ClassId::Sprite as u32,
             name: name.into_boxed_str(),
         });
     }
@@ -520,6 +531,7 @@ fn synthesize_implicit_sprite(meta: &meta::MetaInfo, stem: &str) -> Option<SubAs
     {
         Some(SubAsset {
             file_id: ClassId::Sprite.canonical_subobject_fid(),
+            class_id: ClassId::Sprite as u32,
             name: stem.to_string().into_boxed_str(),
         })
     } else {
@@ -568,34 +580,58 @@ fn build_db(
         }
     }
 
-    // Pass 1: tally every name's distinct-guid owners across both
-    // top-level and sub-asset claims. A name owned by ≥2 distinct guids
-    // is "contested" — every claimant must rename, no one keeps the bare
-    // alias. Single-owner names (including the case where a top-level
-    // and its own sub-asset share a stem) stay bare since reverse-lookup
-    // resolves uniquely.
-    let mut owners: AHashMap<String, AHashSet<u128>> = AHashMap::with_capacity(raw.len());
+    // Type-aware dedup: collisions are scoped by `(name, asset_type)`.
+    // Same-name entries of distinct `asset_type` (`Foo.png` Texture2D +
+    // `Foo.prefab` Prefab) get distinct alias buckets — the consuming
+    // field's C# type discriminates at decode. Embedded sub-asset docs
+    // of container types are excluded from the global pool entirely
+    // (see [Name collisions](docs/asset-database.md#name-collisions)).
+    let is_embedded = |raw_type: AssetTypeRaw| match raw_type {
+        AssetTypeRaw::Native(n) => matches!(
+            ClassId::from_raw(n),
+            Some(
+                ClassId::Prefab
+                    | ClassId::AnimatorController
+                    | ClassId::AnimationClip
+                    | ClassId::AudioMixerController
+            )
+        ),
+        AssetTypeRaw::Script(_) => false,
+    };
+
+    // Pass 1: tally distinct-guid owners per `(name, asset_type)` bucket.
+    let mut owners: AHashMap<(String, AssetTypeRaw), AHashSet<u128>> =
+        AHashMap::with_capacity(raw.len());
     for r in &raw {
-        owners.entry(r.name.clone()).or_default().insert(r.guid);
+        let key = (r.name.clone(), r.asset_type_raw);
+        owners.entry(key).or_default().insert(r.guid);
+        if is_embedded(r.asset_type_raw) {
+            continue;
+        }
         for sub in &r.sub_assets {
-            owners
-                .entry(sub.name.to_string())
-                .or_default()
-                .insert(r.guid);
+            let key = (
+                sub.name.to_string(),
+                AssetTypeRaw::Native(sub.class_id),
+            );
+            owners.entry(key).or_default().insert(r.guid);
         }
     }
-    let contested = |name: &str| owners.get(name).is_some_and(|s| s.len() > 1);
+    let contested = |name: &str, t: AssetTypeRaw| {
+        owners
+            .get(&(name.to_string(), t))
+            .is_some_and(|s| s.len() > 1)
+    };
 
     // Pass 2: walk entries in hint-sorted order, renaming every contested
-    // claim. `taken` tracks names already claimed in this pass so the
-    // disambiguator never picks a candidate that collides with an earlier
-    // (different-guid) entry; same-guid sharing remains allowed (a
-    // contested sub-asset within a renamed parent ends up with the
-    // parent's renamed alias when their hints share enough path).
-    let mut taken: AHashMap<String, u128> = AHashMap::with_capacity(raw.len());
+    // claim. `taken` tracks `(name, asset_type) → guid` pairs already
+    // claimed in this pass so the disambiguator never picks a candidate
+    // that collides with an earlier (different-guid) entry of the same
+    // type; same-guid sharing remains allowed.
+    let mut taken: AHashMap<(String, AssetTypeRaw), u128> = AHashMap::with_capacity(raw.len());
     for r in raw.iter_mut() {
-        if contested(&r.name) {
-            let new_name = disambiguate(&r.name, &r.hint, r.guid, &taken)?;
+        let top_type = r.asset_type_raw;
+        if contested(&r.name, top_type) {
+            let new_name = disambiguate(&r.name, &r.hint, r.guid, top_type, &taken)?;
             if verbose_collisions && let Some(sink) = on_warn {
                 sink(&format!(
                     "warning: name collision on `{}` (guid {:032x}); renamed to `{}`",
@@ -604,7 +640,7 @@ fn build_db(
             }
             r.name = new_name;
         }
-        match taken.get(&r.name) {
+        match taken.get(&(r.name.clone(), top_type)) {
             Some(&prev) if prev != r.guid => anyhow::bail!(
                 "asset-db: name `{}` claimed by both guid {:032x} and {prev:032x} \
                  after dedup — `disambiguate` produced a non-unique alias",
@@ -612,14 +648,21 @@ fn build_db(
                 r.guid,
             ),
             _ => {
-                taken.insert(r.name.clone(), r.guid);
+                taken.insert((r.name.clone(), top_type), r.guid);
             }
         }
 
+        if is_embedded(r.asset_type_raw) {
+            // Prefab-embedded sub-assets bypass the global dedup pool;
+            // sanitization already happened above. Names stay as authored
+            // and resolve via `$Sub@Parent` at the codec layer.
+            continue;
+        }
         for sub in r.sub_assets.iter_mut() {
-            if contested(&sub.name) {
+            let sub_type = AssetTypeRaw::Native(sub.class_id);
+            if contested(&sub.name, sub_type) {
                 let original = sub.name.to_string();
-                let new_name = disambiguate(&original, &r.hint, r.guid, &taken)?;
+                let new_name = disambiguate(&original, &r.hint, r.guid, sub_type, &taken)?;
                 if verbose_collisions && let Some(sink) = on_warn {
                     sink(&format!(
                         "warning: sub-asset name collision on `{}` (parent guid {:032x}); renamed to `{}`",
@@ -631,8 +674,9 @@ fn build_db(
             // Same-guid sharing is allowed — a sub-asset's deduped name
             // will often equal the parent's deduped alias (same hint
             // feeds disambiguate), and that's the desired outcome.
-            if !taken.contains_key(&*sub.name) {
-                taken.insert(sub.name.to_string(), r.guid);
+            let key = (sub.name.to_string(), sub_type);
+            if !taken.contains_key(&key) {
+                taken.insert(key, r.guid);
             }
         }
     }
@@ -779,14 +823,22 @@ fn filename_stem_from_hint(hint: &str) -> String {
 /// `owner_guid` (the latter covers the same-guid sub-asset case where the
 /// parent's deduped top-level alias is a valid name to share).
 ///
+/// `asset_type` scopes the dedup bucket — a candidate is "taken" only when
+/// another guid has claimed the exact `(name, asset_type)` pair. Two assets
+/// of different `asset_type` (e.g. Texture2D `Foo.png` vs Prefab `Foo.prefab`)
+/// share the bare alias `Foo` without contesting because the codec layer
+/// uses the field's declared C# type to pick the right one at lookup time.
+///
 /// Hard-fails when no parent segment yields a free candidate — ambiguity
 /// surfaces at bake time rather than getting papered over with a guid suffix.
-/// See [[asset-database.md#name-collisions]] for the `^` separator rationale.
+/// See [Name collisions](docs/asset-database.md#name-collisions) for the
+/// `^` separator rationale.
 fn disambiguate(
     stem: &str,
     hint: &str,
     owner_guid: u128,
-    taken: &AHashMap<String, u128>,
+    asset_type: AssetTypeRaw,
+    taken: &AHashMap<(String, AssetTypeRaw), u128>,
 ) -> Result<String> {
     let parts: Vec<&str> = Path::new(hint)
         .parent()
@@ -802,7 +854,7 @@ fn disambiguate(
         }
         suffix.insert_str(0, seg);
         let candidate = format!("{stem}^{suffix}");
-        match taken.get(&candidate) {
+        match taken.get(&(candidate.clone(), asset_type)) {
             None => return Ok(candidate),
             Some(&prev) if prev == owner_guid => return Ok(candidate),
             Some(_) => continue,
@@ -942,17 +994,36 @@ mod tests {
 
     #[test]
     fn disambiguate_walks_parents() {
+        let t = AssetTypeRaw::Native(ClassId::Texture2D as u32);
         let mut taken = AHashMap::new();
-        taken.insert("Foo".to_string(), 1u128);
+        taken.insert(("Foo".to_string(), t), 1u128);
         // Nearest parent suffix wins on first try.
-        let alias = disambiguate("Foo", "pkg/Editor/Foo.cs", 2, &taken).unwrap();
+        let alias = disambiguate("Foo", "pkg/Editor/Foo.cs", 2, t, &taken).unwrap();
         assert_eq!(alias, "Foo^Editor");
 
-        // First-level parent already taken (by a different guid) → falls
-        // back to deeper path.
-        taken.insert("Foo^Editor".to_string(), 3);
-        let alias = disambiguate("Foo", "pkg/Editor/Foo.cs", 2, &taken).unwrap();
+        // First-level parent already taken (by a different guid, same type)
+        // → falls back to deeper path.
+        taken.insert(("Foo^Editor".to_string(), t), 3);
+        let alias = disambiguate("Foo", "pkg/Editor/Foo.cs", 2, t, &taken).unwrap();
         assert_eq!(alias, "Foo^pkg/Editor");
+    }
+
+    #[test]
+    fn disambiguate_ignores_collisions_in_other_types() {
+        // A different `AssetTypeRaw` claiming the same alias does NOT
+        // contest — type-aware dedup gives each `(name, type)` its own
+        // bucket. PNG (Texture2D) and prefab (Prefab) named `Foo` both
+        // keep bare `Foo`.
+        let png = AssetTypeRaw::Native(ClassId::Texture2D as u32);
+        let prefab = AssetTypeRaw::Native(ClassId::Prefab as u32);
+        let mut taken = AHashMap::new();
+        taken.insert(("Foo".to_string(), png), 1u128);
+        // disambiguate against the prefab bucket — `Foo` is free here.
+        let alias = disambiguate("Foo", "Assets/Bar/Foo.prefab", 2, prefab, &taken).unwrap();
+        // Walk produces `Foo^Bar` because we always step at least one
+        // parent (disambiguate's contract is "produce a suffixed form");
+        // the contention check upstream is what decides whether to call.
+        assert_eq!(alias, "Foo^Bar");
     }
 
     #[test]
@@ -960,20 +1031,24 @@ mod tests {
         // When the candidate suffix is already mapped to `owner_guid`, the
         // sub-asset can safely share that alias — its lookup path resolves
         // back to the same guid, so no real ambiguity exists.
+        let t = AssetTypeRaw::Native(ClassId::Texture2D as u32);
         let mut taken = AHashMap::new();
-        taken.insert("Cloud1".to_string(), 0xa0_u128);
-        taken.insert("Cloud1^Tower".to_string(), 0xb0_u128);
-        let alias = disambiguate("Cloud1", "Assets/Tower/Cloud1.png", 0xb0_u128, &taken).unwrap();
+        taken.insert(("Cloud1".to_string(), t), 0xa0_u128);
+        taken.insert(("Cloud1^Tower".to_string(), t), 0xb0_u128);
+        let alias =
+            disambiguate("Cloud1", "Assets/Tower/Cloud1.png", 0xb0_u128, t, &taken).unwrap();
         assert_eq!(alias, "Cloud1^Tower");
     }
 
     #[test]
     fn disambiguate_hard_fails_when_no_parent_segments() {
+        let t = AssetTypeRaw::Native(ClassId::Texture2D as u32);
         let mut taken = AHashMap::new();
-        taken.insert("Foo".to_string(), 1u128);
+        taken.insert(("Foo".to_string(), t), 1u128);
         // Hint has no directories — nothing to suffix with. Must error
         // rather than silently fall back to a guid suffix.
-        let err = disambiguate("Foo", "Foo.cs", 2u128, &taken).expect_err("must hard-fail");
+        let err =
+            disambiguate("Foo", "Foo.cs", 2u128, t, &taken).expect_err("must hard-fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("disambiguate"), "msg: {msg}");
         assert!(msg.contains("Foo"), "msg: {msg}");
@@ -993,29 +1068,28 @@ mod tests {
         }
     }
 
-    /// Pin: when a name is claimed by ≥2 distinct guids (whether at the
-    /// top level or inside sub-assets), every claimant must rename — no
-    /// "first wins" carve-out. The deduped form is consistent across
-    /// claimants: each entry resolves through `disambiguate` against its
-    /// own hint.
+    /// Pin: when a name is claimed by ≥2 distinct guids of the same
+    /// `asset_type`, every claimant must rename — no "first wins" carve-out.
+    /// The deduped form is consistent across claimants: each entry resolves
+    /// through `disambiguate` against its own hint.
     ///
-    /// Mirrors the real-fixture `Cloud1` case: a `Cloud1.asset` and a
-    /// `Cloud1.png` Texture2D (whose Sprite sub-asset is also named
-    /// `Cloud1`) all rename. The png's sub-asset shares the parent's
-    /// renamed alias since they have the same guid + hint.
+    /// Two same-type Texture2D `Cloud1.png` files in different folders
+    /// share the bare alias `Cloud1` until type-aware dedup forces both to
+    /// suffix.
     #[test]
     fn build_db_renames_every_claimant_when_name_is_contested() {
-        let asset_guid = 0xa0_u128;
-        let png_guid = 0xb0_u128;
+        let png_a_guid = 0xa0_u128;
+        let png_b_guid = 0xb0_u128;
         let sprite_fid: i64 = 21300000;
 
         let raw = vec![
-            raw_native("Assets/Other/Cloud1.asset", asset_guid, vec![]),
+            raw_native("Assets/Other/Cloud1.png", png_a_guid, vec![]),
             raw_native(
                 "Assets/Tower/Cloud1.png",
-                png_guid,
+                png_b_guid,
                 vec![SubAsset {
                     file_id: sprite_fid,
+                    class_id: ClassId::Sprite as u32,
                     name: "Cloud1".into(),
                 }],
             ),
@@ -1023,33 +1097,202 @@ mod tests {
 
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
 
-        let asset_entry = db.find_by_guid(asset_guid).unwrap();
-        let png_entry = db.find_by_guid(png_guid).unwrap();
+        let a_entry = db.find_by_guid(png_a_guid).unwrap();
+        let b_entry = db.find_by_guid(png_b_guid).unwrap();
 
         // Neither entry keeps the bare alias — both renamed.
-        assert_ne!(&*asset_entry.name, "Cloud1");
-        assert_ne!(&*png_entry.name, "Cloud1");
+        assert_ne!(&*a_entry.name, "Cloud1");
+        assert_ne!(&*b_entry.name, "Cloud1");
         assert!(
-            asset_entry.name.starts_with("Cloud1^"),
-            "asset top-level not deduped: {}",
-            asset_entry.name,
+            a_entry.name.starts_with("Cloud1^"),
+            "first png top-level not deduped: {}",
+            a_entry.name,
         );
         assert!(
-            png_entry.name.starts_with("Cloud1^"),
-            "png top-level not deduped: {}",
-            png_entry.name,
+            b_entry.name.starts_with("Cloud1^"),
+            "second png top-level not deduped: {}",
+            b_entry.name,
         );
         // Distinct hints → distinct deduped suffixes.
-        assert_ne!(&*asset_entry.name, &*png_entry.name);
+        assert_ne!(&*a_entry.name, &*b_entry.name);
 
-        // Sub-asset dedup: png's Sprite shares the parent's renamed alias
-        // (same guid + same hint feeds `disambiguate` to the same suffix).
-        let sub = &png_entry.sub_assets[0];
-        assert_eq!(sub.file_id, sprite_fid);
+        // Sub-asset dedup: the Sprite sub-asset's `Cloud1` lives in its own
+        // type-bucket (Sprite, not Texture2D), so it isn't contested by the
+        // Texture2D collision above. It stays bare. The png_b entry is the
+        // only Sprite-bucket owner.
+        let png_b_sub = &b_entry.sub_assets[0];
+        assert_eq!(png_b_sub.file_id, sprite_fid);
         assert_eq!(
-            &*sub.name, &*png_entry.name,
-            "sub-asset name must match parent's deduped top-level alias",
+            &*png_b_sub.name, "Cloud1",
+            "Sprite sub-asset should stay bare under type-aware dedup",
         );
+    }
+
+    /// Pin type-aware dedup: a Texture2D and a Prefab sharing the stem
+    /// `Foo` both keep the bare alias. Reverse lookup discriminates by
+    /// the field's declared C# type at the consumer layer.
+    #[test]
+    fn build_db_keeps_bare_alias_for_type_distinct_collisions() {
+        let png_guid = 0xa0_u128;
+        let prefab_guid = 0xb0_u128;
+        let raw = vec![
+            RawEntry {
+                guid: png_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::Texture2D as u32),
+                hint: "Assets/UI/Foo.png".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+            RawEntry {
+                guid: prefab_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
+                hint: "Assets/UI/Foo.prefab".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        // Both keep bare `Foo` because they live in distinct type buckets.
+        assert_eq!(&*db.find_by_guid(png_guid).unwrap().name, "Foo");
+        assert_eq!(&*db.find_by_guid(prefab_guid).unwrap().name, "Foo");
+    }
+
+    /// Pin: AnimatorController-embedded sub-assets are excluded from the
+    /// global dedup pool, mirroring the prefab-embedded rule. Without the
+    /// exclusion, an embedded AnimatorState named `Idle` would contest a
+    /// hypothetical standalone `.asset` of the same name AND same Unity
+    /// classID (AnimatorState exists as both an embedded sub of
+    /// `.controller` and a top-level `.asset` in Unity), forcing both to
+    /// rename via parent-dir suffix. The exclusion keeps the embedded
+    /// state in its parent's namespace where it's addressed via
+    /// `$Idle@Player` at the consumer layer.
+    #[test]
+    fn build_db_skips_controller_embedded_subassets_in_global_pool() {
+        const ANIMATOR_STATE_CLASS_ID: u32 = 1102;
+        let controller_guid = 0xc0_u128;
+        let other_state_guid = 0xd0_u128;
+        let raw = vec![
+            RawEntry {
+                guid: controller_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::AnimatorController as u32),
+                hint: "Assets/Anim/Player.controller".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![SubAsset {
+                    file_id: -123_456_789_012,
+                    class_id: ANIMATOR_STATE_CLASS_ID,
+                    name: "Idle".into(),
+                }],
+            },
+            // Standalone .asset whose top class IS AnimatorState — same
+            // (name, class_id) bucket as the embedded one. With
+            // exclusion, only this one claims the global `Idle` alias.
+            RawEntry {
+                guid: other_state_guid,
+                asset_type_raw: AssetTypeRaw::Native(ANIMATOR_STATE_CLASS_ID),
+                hint: "Assets/Other/Idle.asset".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        // Standalone keeps bare `Idle`.
+        assert_eq!(&*db.find_by_guid(other_state_guid).unwrap().name, "Idle");
+        // Embedded state stays as authored in the parent's namespace.
+        let ctrl_entry = db.find_by_guid(controller_guid).unwrap();
+        assert_eq!(&*ctrl_entry.sub_assets[0].name, "Idle");
+    }
+
+    /// Same shape as the controller test, for AudioMixerController:
+    /// AudioMixerGroup sub-asset class collides with itself between an
+    /// embedded `Main.mixer` group and a hypothetical standalone
+    /// `.asset` of the same class. Exclusion keeps the embed in the
+    /// parent's namespace.
+    #[test]
+    fn build_db_skips_mixer_embedded_subassets_in_global_pool() {
+        const AUDIO_MIXER_GROUP_CLASS_ID: u32 = 273;
+        let mixer_guid = 0xe0_u128;
+        let other_group_guid = 0xf0_u128;
+        let raw = vec![
+            RawEntry {
+                guid: mixer_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::AudioMixerController as u32),
+                hint: "Assets/Audio/Main.mixer".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![SubAsset {
+                    file_id: 9_001,
+                    class_id: AUDIO_MIXER_GROUP_CLASS_ID,
+                    name: "Master".into(),
+                }],
+            },
+            RawEntry {
+                guid: other_group_guid,
+                asset_type_raw: AssetTypeRaw::Native(AUDIO_MIXER_GROUP_CLASS_ID),
+                hint: "Assets/Other/Master.asset".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        assert_eq!(&*db.find_by_guid(other_group_guid).unwrap().name, "Master");
+        let mixer_entry = db.find_by_guid(mixer_guid).unwrap();
+        assert_eq!(&*mixer_entry.sub_assets[0].name, "Master");
+    }
+
+    /// Pin: prefab-embedded sub-assets are excluded from the global dedup
+    /// pool. Their names stay as authored even when another asset in the
+    /// project shares the name. They resolve via `$Sub@Parent` at the
+    /// consumer layer, not the global alias bucket.
+    #[test]
+    fn build_db_skips_prefab_embedded_subassets_in_global_pool() {
+        let prefab_guid = 0xa0_u128;
+        let other_clip_guid = 0xb0_u128;
+        let raw = vec![
+            RawEntry {
+                guid: prefab_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
+                hint: "Assets/UI/PatternBG.prefab".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![SubAsset {
+                    file_id: -4_468_419_427_481_386_445,
+                    class_id: ClassId::AnimationClip as u32,
+                    name: "Animation".into(),
+                }],
+            },
+            RawEntry {
+                guid: other_clip_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::AnimationClip as u32),
+                hint: "Assets/Other/Animation.anim".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        // Standalone .anim keeps bare `Animation` — the prefab-embedded
+        // `Animation` doesn't claim the global alias.
+        assert_eq!(
+            &*db.find_by_guid(other_clip_guid).unwrap().name,
+            "Animation"
+        );
+        // Prefab-embedded sub-asset keeps its raw name (lives in parent's
+        // namespace; `$Animation@PatternBG` at the consumer layer).
+        let prefab_entry = db.find_by_guid(prefab_guid).unwrap();
+        assert_eq!(&*prefab_entry.sub_assets[0].name, "Animation");
     }
 
     /// Pin: a single-owner name (one guid only, even if it appears as both
@@ -1064,6 +1307,7 @@ mod tests {
             png_guid,
             vec![SubAsset {
                 file_id: 21300000,
+                class_id: ClassId::Sprite as u32,
                 name: "Lone".into(),
             }],
         )];

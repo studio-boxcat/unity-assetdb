@@ -113,17 +113,28 @@ through the optional callbacks. Pass `None` to discard.
 
 ### Name collisions
 
-Filename stems aren't unique across a project (e.g. multiple `Dependencies.asmdef`).
-The bake's dedup pass operates on a single shared name pool that covers both
-top-level filenames and YAML `m_Name` sub-asset names (sprite-sheet
-sub-sprites, etc.) — sub-assets are owned by their parent's guid, so a
-Texture2D and its lone same-named Sprite sub-asset count as a single owner.
+Filename stems aren't unique across a project (e.g. multiple
+`Dependencies.asmdef`). The bake's dedup pass operates on a name pool
+keyed by `(name, asset_type)` — same-name claims of distinct `asset_type`
+(`Foo.png` Texture2D vs. `Foo.prefab` Prefab) DON'T contest because
+consumers can discriminate at the lookup layer using the field's declared
+C# type.
 
-**No-winner rule:** when ≥ 2 distinct guids claim the same name, **every**
-claimant gets renamed via the parent-dir suffix walk. Nobody keeps the bare
-name. This trades a slightly noisier alias for byte-stable output: there's
-no "first hint wins" bias to track, and renaming an unrelated asset can
-never rotate which collider holds the bare form. Single-owner names stay
+**Sub-asset namespacing:** sprite-sheet style sub-assets (Sprite
+sub-objects on a `.spriteatlas` or texture) join the global pool — they're
+addressable as bare names. Prefab-embedded sub-assets (legacy
+`AnimationClip` doc inline in a `.prefab`, AnimatorState in a
+`.controller`, AudioMixerGroup in a `.mixer`, Timeline tracks in a
+`.playable`) are EXCLUDED from the global pool; they live in their parent
+prefab's namespace and consumers resolve them through a parent-scoped
+addressing scheme.
+
+**No-winner rule:** when ≥ 2 distinct guids claim the same `(name,
+asset_type)` pair, **every** claimant gets renamed via the parent-dir
+suffix walk. Nobody keeps the bare alias. This trades a slightly noisier
+alias for byte-stable output: there's no "first hint wins" bias to track,
+and renaming an unrelated asset can never rotate which collider holds the
+bare form. Single-owner names within a `(name, asset_type)` bucket stay
 bare.
 
 Disambiguation walks the nearest unique parent-dir, joined with `^`:
