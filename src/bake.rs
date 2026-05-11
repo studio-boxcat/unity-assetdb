@@ -59,6 +59,24 @@ type NameSanitizerRef<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
 /// Borrowed view of a [`WarnSink`]. See [`NameSanitizerRef`].
 type WarnSinkRef<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
+/// File extensions whose asset has embedded sub-asset docs that should
+/// NOT join the global dedup pool — they live in the parent's namespace
+/// and consumers resolve them via parent-scoped addressing (`$Sub@Parent`).
+///
+/// Extension-keyed rather than `AssetType`-keyed because the top doc of a
+/// `.playable` file is whichever sub-doc Unity sorts first by hashed fileID
+/// (often an `AnimationTrack`, not the `TimelineAsset` itself), so the
+/// resulting `AssetTypeRaw::Script(...)` carries an unstable script guid.
+/// The extension is the only stable container discriminator.
+const EMBEDDED_CONTAINER_EXTS: &[&str] = &["prefab", "controller", "anim", "mixer", "playable"];
+
+fn is_embedded_container(hint: &str) -> bool {
+    Path::new(hint)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| EMBEDDED_CONTAINER_EXTS.contains(&ext))
+}
+
 /// Convert `SystemTime` → ns-since-UNIX. Saturates to 0 on pre-epoch
 /// (which would only happen if the user's clock is bogus).
 fn mtime_ns(t: SystemTime) -> u64 {
@@ -586,18 +604,6 @@ fn build_db(
     // field's C# type discriminates at decode. Embedded sub-asset docs
     // of container types are excluded from the global pool entirely
     // (see [Name collisions](docs/asset-database.md#name-collisions)).
-    let is_embedded = |raw_type: AssetTypeRaw| match raw_type {
-        AssetTypeRaw::Native(n) => matches!(
-            ClassId::from_raw(n),
-            Some(
-                ClassId::Prefab
-                    | ClassId::AnimatorController
-                    | ClassId::AnimationClip
-                    | ClassId::AudioMixerController
-            )
-        ),
-        AssetTypeRaw::Script(_) => false,
-    };
 
     // Pass 1: tally distinct-guid owners per `(name, asset_type)` bucket.
     let mut owners: AHashMap<(String, AssetTypeRaw), AHashSet<u128>> =
@@ -605,7 +611,7 @@ fn build_db(
     for r in &raw {
         let key = (r.name.clone(), r.asset_type_raw);
         owners.entry(key).or_default().insert(r.guid);
-        if is_embedded(r.asset_type_raw) {
+        if is_embedded_container(&r.hint) {
             continue;
         }
         for sub in &r.sub_assets {
@@ -652,7 +658,7 @@ fn build_db(
             }
         }
 
-        if is_embedded(r.asset_type_raw) {
+        if is_embedded_container(&r.hint) {
             // Prefab-embedded sub-assets bypass the global dedup pool;
             // sanitization already happened above. Names stay as authored
             // and resolve via `$Sub@Parent` at the codec layer.
@@ -1248,6 +1254,65 @@ mod tests {
         assert_eq!(&*db.find_by_guid(other_group_guid).unwrap().name, "Master");
         let mixer_entry = db.find_by_guid(mixer_guid).unwrap();
         assert_eq!(&*mixer_entry.sub_assets[0].name, "Master");
+    }
+
+    /// Pin: `.playable` files are treated as embedded containers — their
+    /// Timeline track sub-assets bypass the global dedup pool. Many
+    /// `.playable` files in a project share Unity-default track names like
+    /// `Animation Track (2)`; without the exclusion they contest in the
+    /// global pool and `disambiguate` hard-fails when the shared
+    /// parent-dir suffixes are exhausted. Exclusion is keyed on the
+    /// `.playable` extension (`is_embedded_container`) because the
+    /// top-doc script guid of a playable is whichever sub-doc Unity
+    /// sorts first by hashed fileID — unstable as a discriminator.
+    #[test]
+    fn build_db_skips_playable_embedded_tracks_in_global_pool() {
+        // Track class id + script guid placeholders — bake stores both
+        // but doesn't validate them against any registry. Extension is
+        // the discriminator that triggers the exclusion.
+        const ANIMATION_TRACK_CLASS_ID: u32 = 5004;
+        let some_script_guid = 0xd21dcc2386d650c4597f3633c75a1f98_u128;
+        let pa_guid = 0xa0_u128;
+        let pb_guid = 0xb0_u128;
+        let raw = vec![
+            RawEntry {
+                guid: pa_guid,
+                asset_type_raw: AssetTypeRaw::Script(some_script_guid),
+                hint: "Assets/Anim/PlayableA.playable".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![SubAsset {
+                    file_id: -123_456_789,
+                    class_id: ANIMATION_TRACK_CLASS_ID,
+                    name: "Animation Track (2)".into(),
+                }],
+            },
+            RawEntry {
+                guid: pb_guid,
+                asset_type_raw: AssetTypeRaw::Script(some_script_guid),
+                hint: "Assets/Anim/PlayableB.playable".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![SubAsset {
+                    file_id: -987_654_321,
+                    class_id: ANIMATION_TRACK_CLASS_ID,
+                    name: "Animation Track (2)".into(),
+                }],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        // Both playables keep their embedded track names as authored —
+        // sub-assets live in the parent's namespace, not the global pool.
+        assert_eq!(
+            &*db.find_by_guid(pa_guid).unwrap().sub_assets[0].name,
+            "Animation Track (2)"
+        );
+        assert_eq!(
+            &*db.find_by_guid(pb_guid).unwrap().sub_assets[0].name,
+            "Animation Track (2)"
+        );
     }
 
     /// Pin: prefab-embedded sub-assets are excluded from the global dedup
