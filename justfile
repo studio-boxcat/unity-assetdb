@@ -42,22 +42,6 @@ profile: build _check-meow-client
     UNITY_ASSETDB_TIMING=1 {{BIN}} bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}
     @ls -lh {{PROFILE_OUT}}
 
-# Sampling flamegraph via samply (Firefox Profiler). Opens the viewer
-# automatically when the run finishes.
-#
-# Cold by default — that's where the parser hot paths show up. For warm-path
-# profiling (cache-hit traversal), pass `cold=0`: `just profile-flamegraph cold=0`.
-profile-flamegraph cold="1": build _check-meow-client
-    @command -v samply >/dev/null || (echo "samply not installed (cargo install samply)" && exit 1)
-    @mkdir -p {{PROFILE_OUT}}
-    @if [ "{{cold}}" = "1" ]; then \
-      rm -f {{PROFILE_OUT}}/asset-db.bin {{PROFILE_OUT}}/asset-db.cache.bin; \
-    fi
-    samply record --save-only --output {{PROFILE_OUT}}/profile.json \
-      {{BIN}} bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}
-    @echo "Saved: {{PROFILE_OUT}}/profile.json"
-    @echo "View:  samply load {{PROFILE_OUT}}/profile.json"
-
 # Internal: bail if the meow-tower checkout isn't at MEOW_CLIENT.
 _check-meow-client:
     @test -d "{{MEOW_CLIENT}}/Assets" || ( \

@@ -1,5 +1,8 @@
 # Asset Database
 
+> **Related:** [`profiling.md`](profiling.md) (wall-clock + per-phase
+> baselines + samply hotspots for the bake pipeline below).
+
 The asset DB maps Unity asset GUIDs (and sub-asset fileIDs) to human-readable
 names. The binary stores the bare name; how downstream consumers render it
 (e.g. as a `$Alias` ref, a Unity Addressables key, a catalog entry) is up to

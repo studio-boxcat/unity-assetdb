@@ -3,15 +3,28 @@
 > **Related:** [`asset-database.md`](asset-database.md) (the artifact + bake
 > pipeline being profiled).
 
-Two recipes in the project [justfile]:
+One recipe in the project [justfile]:
 
 - **`just profile`** — wall-clock cold/warm + per-phase timings via
   [hyperfine] + the built-in `UNITY_ASSETDB_TIMING=1` phase counter.
-- **`just profile-flamegraph`** — sampling profile via [samply]; output is a
-  Firefox Profiler JSON.
 
-Both default to `MEOW_CLIENT=/Users/jameskim/Develop/meow-tower`. Override
+Defaults to `MEOW_CLIENT=/Users/jameskim/Develop/meow-tower`. Override
 via env: `MEOW_CLIENT=/path/to/other/project just profile`.
+
+For a flamegraph, drive [samply] directly (release symbols come from
+the line-tables-only debug info pinned in `Cargo.toml`):
+
+```sh
+cargo build --release
+rm -f /tmp/unity-assetdb-profile/asset-db{,.cache}.bin   # cold only
+samply record --unstable-presymbolicate --save-only \
+  --output /tmp/unity-assetdb-profile/cold.json \
+  target/release/unity-assetdb bake --project "$MEOW_CLIENT" --out-dir /tmp/unity-assetdb-profile
+samply load /tmp/unity-assetdb-profile/cold.json   # opens Firefox Profiler
+```
+
+`--unstable-presymbolicate` emits a `.syms.json` sidecar so the trace
+opens with full symbols even without the binary alongside.
 
 [justfile]: ../justfile
 [hyperfine]: https://github.com/sharkdp/hyperfine
@@ -21,12 +34,9 @@ via env: `MEOW_CLIENT=/path/to/other/project just profile`.
 
 ```sh
 brew install hyperfine                # one-time
-cargo install samply                  # one-time
+cargo install samply                  # one-time (only if flamegraphing)
 
 just profile                          # cold/warm + phase breakdown
-just profile-flamegraph               # cold flamegraph (default)
-just profile-flamegraph cold=0        # warm flamegraph
-samply load /tmp/unity-assetdb-profile/profile.json   # open viewer
 ```
 
 ## What each phase covers
@@ -41,13 +51,14 @@ Source: `BakeOptions::verbose_timing` in `src/bake.rs`.
 | `build` | `build_db` — sub-asset dedup pass (type-aware bucketing, parent-dir suffix walk for collisions) + script-guid interning + final sort. |
 | `write` | `store::write` + `store::write_cache` — bincode encode + file write. Shows `(skipped)` on the no-op path (every entry was a cache hit AND nothing dropped from the cache). |
 
-## Baseline numbers — meow-tower (18,171 entries, 20,562 `.meta` files)
+## Baseline numbers — meow-tower (18,169 entries, 20,560 `.meta` files)
 
 Captured 2026-05-11 against
 [meow-tower](https://github.com/studio-boxcat/meow-tower)'s `Assets/`
-tree on an M-series mac, post-optimization (`1b05485` single-pass
-parser + cache-hit stat trim, `da74104` walker `standard_filters` off).
-Numbers are 8-run hyperfine means with `--warmup 3`.
+tree on an M-series mac (12 logical cores), post-optimization
+(`1b05485` single-pass parser + cache-hit stat trim, `da74104`
+walker `standard_filters` off). Numbers are 5-run hyperfine means
+with `--warmup 2`.
 
 | Scenario | Total | Notes |
 |----------|------:|-------|
@@ -57,12 +68,12 @@ Numbers are 8-run hyperfine means with `--warmup 3`.
 ### Per-phase breakdown
 
 ```
-warm:  walked=20562 hit=18171 parsed=0
-       cache=5.1ms walk=42.8ms build=17.7ms write=(skipped) total=65.7ms
+warm:  walked=20560 hit=18169 parsed=0
+       cache=3.5ms walk=34.6ms build=17.5ms write=(skipped) total=55.6ms
 
-cold:  walked=20562 hit=0 parsed=18171
-       cache=0.0ms walk=768ms build=24.7ms write=4.9ms total=798ms
-       (OS cache cold; warm-OS rerun after this writes ~370ms)
+cold:  walked=20560 hit=0 parsed=18169
+       cache=0.0ms walk=745ms build=18.4ms write=5.9ms total=769ms
+       (OS cache cold; warm-OS rerun after this writes ~400ms)
 ```
 
 ### Optimization history
@@ -81,35 +92,99 @@ can reference). 8 previously-excluded entries now bake in meow-tower
 
 ### Headline observations
 
-- **`walk` dominates both paths.** Warm: 43 ms of 66 ms (65%) just to stat
-  20,562 `.meta` files + check 18,171 cache keys. Cold: ~770 ms of 800 ms.
-- **`build` is small and stable.** ~18 ms for the dedup pass over 18k
-  entries; doesn't vary with cold/warm because it operates on in-memory
-  `RawEntry`s post-walk.
-- **The no-op-skip write path saves ~7 ms** on the warm path — visible in
-  the gap between `write=(skipped)` and the `wrote` cold value.
-- **Cold-walk is parser-bound, not IO-bound, on a warm OS cache.** 1.31 s
-  drops to ~340 ms with the OS cache hot — IO is ~1 s of the cold-cold
-  number; the remaining 340 ms is `.meta` + asset YAML parse + the
-  type-aware dedup setup, scattered across the worker threads.
+- **`walk` dominates both paths** — ~62% of warm wall (34.6 of 55.6 ms)
+  and ~97% of cold wall (745 of 769 ms). The Deep profile below
+  unpacks where the walk time actually goes.
+- **`build` is small and stable** (~17 ms over 18 k entries). Doesn't
+  vary with cold/warm because it operates on in-memory `RawEntry`s
+  post-walk.
+- **The no-op write-skip path saves ~6 ms** on the warm path — visible
+  in the gap between `write=(skipped)` and the cold `wrote` value.
 
 ## Flamegraph reading
 
-`just profile-flamegraph` writes `/tmp/unity-assetdb-profile/profile.json`.
-Open with `samply load <path>` to launch Firefox Profiler with the data
-loaded. Expected hotspots on the cold path:
+Open the samply JSON with `samply load <path>` to launch Firefox
+Profiler.
 
-- `meta::parse_sprite_sheet` — line-oriented scan of every texture's
-  `.meta`. Plenty of `str::lines` + `trim` overhead per file but constant
-  per-file; only dominant when the project is sprite-heavy.
+### Deep profile (2026-05-11)
+
+Self-time breakdown, symbolicated via samply `--unstable-presymbolicate`
+against the release binary with line tables:
+
+**Cold path (~400 ms, 12 workers, ~5 k samples):**
+
+| Bucket | Self time | What it is |
+|--------|----------:|------------|
+| `read` syscall | 61.6% | Reading `.meta` + asset YAML from disk |
+| `__open` | 15.1% | File opens |
+| `stat` | 6.2% | File metadata |
+| `__semwait_signal` | 7.9% | Thread idle/coordination |
+| `__getdirentries64` | 1.7% | Directory enumeration |
+| `core::slice::memchr` + `str::trim_start_matches` | ~2.3% | YAML line scanning |
+| Everything else (parse logic, hashing, alloc) | ~5% | — |
+
+**~85% pure syscall I/O.** Cold has essentially no Rust-level
+optimization headroom without an mmap or io_uring redesign.
+
+**Warm path (~60 ms, 12 workers, ~220 samples — percentages are
+±2 pp at this sample count):**
+
+- `ignore::walk::Worker::run` is ~74% inclusive but our visitor
+  (`process_one`) is only ~29% inclusive — i.e. **~45% of warm
+  CPU is `ignore`-internal machinery** (DirEntry materialization,
+  work-stealing dispatch). With `standard_filters(false)` already
+  set, that machinery is the floor for `ignore` — no further
+  tunables.
+- Self-time: ~19% `stat` (per-`.meta` cache check) + ~14% `__open` +
+  ~10% `__getdirentries64` + ~17% `__semwait_signal` ≈ 60% syscalls
+  + thread wait. ~9% allocator churn (libsystem_malloc), ~3% path
+  manipulation.
+
+### What was tried and didn't help
+
+| Attempt | Outcome |
+|---------|---------|
+| Lazy panic-label allocation in the worker closure (don't format `Path::display()` per file unless erroring) | Perf-neutral — within hyperfine σ. Not worth the code churn. |
+| Skip `String::replace('\\','/')` in `rel_hint` on Unix | Perf-neutral. Dropped. |
+| Hand-rolled `std::fs::read_dir` + `std::thread::scope` walker | **+11 ms warm**. Single `Mutex<Vec<PathBuf>>` work stack can't match `ignore`'s crossbeam-deque work-stealing scheduler under 12 workers. Reverted. |
+| Tune `ignore::WalkBuilder` further | No knobs left — `standard_filters(false)`, `follow_links(false)`, `filter_entry` for hidden are already set. The remaining cost is per-entry `DirEntry` construction + dispatch, which isn't configurable. |
+
+### Where future wins could come from
+
+The structural floor only breaks with a redesign. The lone candidate
+is a hand-rolled lock-free work-stealing walker — matching `ignore`'s
+scheduler quality but trimmed to our needs (no `DirEntry`
+materialization for non-`.meta` files). ~200+ LOC of concurrency
+code chasing 5–10 ms of warm; doesn't pencil out for a tool that
+already finishes in 60 ms.
+
+### Considered and rejected
+
+- **Dir-mtime as a cache shortcut** — the obvious idea of skipping
+  per-file `stat` when a directory's mtime is stable doesn't work:
+  Unix dir mtime only changes when entries are added/removed/renamed,
+  not when a contained file's contents (or mtime) are edited. Unity
+  touches the `.meta` mtime on reimport without touching the parent
+  dir, so dir-mtime stability is consistent with a stale cache.
+  The per-file mtime check is the only correct signal.
+
+### Rust-CPU symbols to recognize
+
+These are the parser/build hotspots that surface once syscall I/O
+recedes (warm-OS cold runs, or warm-bake parse-miss runs). On a
+cold-cold trace they're buried under `read`/`open` and hard to see.
+
+- `meta::parse` — line-oriented scan of every `.meta`. `str::lines` +
+  `trim` overhead per file; constant per-file, only dominant when the
+  project is sprite-heavy.
 - `asset::parse` — line-oriented YAML peek for the WithSubAssets
   extensions (`.prefab`/`.controller`/`.anim`/`.mixer`/`.playable`/
-  `.asset`/`.spriteatlas*`). Hot for projects with many prefabs.
+  `.asset`/`.spriteatlas*`). Hot for prefab-heavy projects.
 - `bincode::decode_from_slice` on the cache path — only fires when a
   cache file is present. Inert on the cold-cold path.
 
-`build_db`'s hashmap churn appears as `ahash::AHasher` callers but it's
-~17 ms total, so it'll be visually thin in the flamegraph.
+`build_db`'s hashmap churn appears as `ahash::AHasher` callers but
+it's ~17 ms total — thin in the flamegraph.
 
 ## Comparing to pspec's wrapper
 

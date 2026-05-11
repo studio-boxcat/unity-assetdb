@@ -29,9 +29,9 @@ are found. Without `--out-dir`, writes to `<project>/Library/unity-assetdb/`.
 
 ## Profiling
 
-`just profile` (hyperfine cold/warm + phase breakdown) and `just
-profile-flamegraph` (samply). See [`docs/profiling.md`](docs/profiling.md)
-for baseline numbers and per-phase semantics.
+`just profile` (hyperfine cold/warm + phase breakdown). For flamegraphs,
+drive `samply record` directly — see [`docs/profiling.md`](docs/profiling.md)
+for the invocation, baseline numbers, and per-phase semantics.
 
 ## Status
 

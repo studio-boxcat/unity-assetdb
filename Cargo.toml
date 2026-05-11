@@ -39,3 +39,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 # tests in tests/bake.rs — we need to drift mtimes on demand to exercise
 # the warm-path fast/slow-path bake branches.
 filetime = "0.2"
+
+# Keep line tables in release so samply can symbolicate flamegraphs.
+[profile.release]
+debug = "line-tables-only"
