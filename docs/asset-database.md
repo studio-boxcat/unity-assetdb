@@ -72,12 +72,27 @@ A name in pull output resolves by GUID + fileID:
 ## Populating
 
 `unity-assetdb bake [--project <path>] [--out-dir <path>]` walks
-`<project>/Assets/` in parallel (gitignore-respecting via the [`ignore`]
-crate) and writes the binary. Without `--project` the command climbs from CWD
-until both `Assets/` and `ProjectSettings/` are found. `--out-dir` redirects
-both `asset-db.bin` and the sibling `asset-db.cache.bin` away from the
-default — used for fixture-regen recipes that read from an upstream Unity
-project but must not write back into it.
+`<project>/Assets/` and `<project>/Packages/` in parallel via the
+[`ignore`] crate and writes the binary. Without `--project` the
+command climbs from CWD until both `Assets/` and `ProjectSettings/`
+are found. `--out-dir` redirects both `asset-db.bin` and the sibling
+`asset-db.cache.bin` away from the default — used for fixture-regen
+recipes that read from an upstream Unity project but must not write
+back into it.
+
+**Walker ignore behavior** is intentionally narrower than `ignore`'s
+default `standard_filters`:
+
+- Unity-hidden segments (leading `.`, trailing `~`) are filtered — this
+  matches Unity's own special-folder rules.
+- `.gitignore` files anywhere in the project tree are NOT honored.
+  Unity itself doesn't, and a gitignored `.meta` still carries a
+  guid that other prefabs can reference. Excluding such files would
+  cause spurious "unresolved asset reference" hard-fails on the
+  consumer side.
+- `Library/`, `Temp/`, build artifacts (`.csproj`, `.sln`) sit
+  outside the walker's roots (`Assets/`, `Packages/`), so they're
+  never visited regardless of any ignore rules.
 
 The bake is mtime-cached via `asset-db.cache.bin`: re-runs only re-parse
 files whose `.meta` or asset mtime has changed. On a 16k-entry project

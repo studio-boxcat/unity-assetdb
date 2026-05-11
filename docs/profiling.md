@@ -41,34 +41,49 @@ Source: `BakeOptions::verbose_timing` in `src/bake.rs`.
 | `build` | `build_db` — sub-asset dedup pass (type-aware bucketing, parent-dir suffix walk for collisions) + script-guid interning + final sort. |
 | `write` | `store::write` + `store::write_cache` — bincode encode + file write. Shows `(skipped)` on the no-op path (every entry was a cache hit AND nothing dropped from the cache). |
 
-## Baseline numbers — meow-tower (18,163 entries, 20,553 `.meta` files)
+## Baseline numbers — meow-tower (18,171 entries, 20,562 `.meta` files)
 
 Captured 2026-05-11 against
-[meow-tower](https://github.com/studio-boxcat/meow-tower)'s `Assets/` tree on
-an M-series mac. Numbers are 5-run hyperfine means with `--warmup 2`.
+[meow-tower](https://github.com/studio-boxcat/meow-tower)'s `Assets/`
+tree on an M-series mac, post-optimization (`1b05485` single-pass
+parser + cache-hit stat trim, `da74104` walker `standard_filters` off).
+Numbers are 8-run hyperfine means with `--warmup 3`.
 
 | Scenario | Total | Notes |
 |----------|------:|-------|
-| **Cold, OS cache cold** | ~1.34 s | First bake after a fresh checkout; every `.meta`/`.asset` read hits disk. Dominated by `walk` (≈1.31 s). |
-| **Cold, OS cache warm** | 377 ms ± 11 ms | What `just profile` reports — files are page-cache-hot but our cache file is absent. |
-| **Warm (full hit)** | 80 ms ± 7 ms | Every entry from `asset-db.cache.bin`; `write` skips the no-op path. |
+| **Cold, OS cache cold** | ~800 ms | First bake after a fresh checkout; every `.meta`/`.asset` read hits disk. Dominated by `walk` (~770 ms). |
+| **Warm (full hit)** | 64 ms ± 5 ms | Every entry from `asset-db.cache.bin`; `write` skips the no-op path. |
 
 ### Per-phase breakdown
 
 ```
-warm:  walked=20553 hit=18163 parsed=0
-       cache=2.9ms walk=46.8ms build=16.7ms write=(skipped) total=66.5ms
+warm:  walked=20562 hit=18171 parsed=0
+       cache=5.1ms walk=42.8ms build=17.7ms write=(skipped) total=65.7ms
 
-cold:  walked=20553 hit=0 parsed=18163
-       cache=0.0ms walk=1.31s build=24.5ms write=6.7ms total=1.34s
-       (OS cache cold; the 377ms hyperfine cold is OS-cache-warm)
+cold:  walked=20562 hit=0 parsed=18171
+       cache=0.0ms walk=768ms build=24.7ms write=4.9ms total=798ms
+       (OS cache cold; warm-OS rerun after this writes ~370ms)
 ```
+
+### Optimization history
+
+| Change | Warm walk | Total warm |
+|--------|----------:|----------:|
+| Baseline (pre-optimization) | 47 ms | 80 ms |
+| `1b05485` single-pass parser + cache-hit stat trim | 46 ms | 76 ms |
+| `da74104` `standard_filters(false)` (skip gitignore parse) | **43 ms** | **64 ms** |
+
+`da74104` also flipped a semantic: `.gitignore` files inside
+`Assets/`/`Packages/` are no longer honored (Unity itself doesn't
+honor them; gitignored `.meta` files still carry guids that prefabs
+can reference). 8 previously-excluded entries now bake in meow-tower
+— Zenject codegen, SmartLibrary `.asset` files, dev scratch `.cs`.
 
 ### Headline observations
 
-- **`walk` dominates both paths.** Warm: 47 ms of 67 ms (70%) just to stat
-  20,553 `.meta` files + check 18,163 cache keys. Cold: ~1.3 s of 1.34 s.
-- **`build` is small and stable.** ~17 ms for the dedup pass over 18k
+- **`walk` dominates both paths.** Warm: 43 ms of 66 ms (65%) just to stat
+  20,562 `.meta` files + check 18,171 cache keys. Cold: ~770 ms of 800 ms.
+- **`build` is small and stable.** ~18 ms for the dedup pass over 18k
   entries; doesn't vary with cold/warm because it operates on in-memory
   `RawEntry`s post-walk.
 - **The no-op-skip write path saves ~7 ms** on the warm path — visible in
