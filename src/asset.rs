@@ -219,4 +219,34 @@ Sprite:
         assert_eq!(info.sub_assets[0].name, "spr_a");
         assert_eq!(info.sub_assets[1].name, "spr_b");
     }
+
+    /// `asset::parse` is class-blind: every named sub-doc surfaces
+    /// regardless of class. The extension-aware filter that drops
+    /// GO-tree structural docs from prefabs lives in `bake::process_one`
+    /// — pinning that here keeps the parser layer's contract clear.
+    #[test]
+    fn parses_keeps_all_named_subdocs_regardless_of_class() {
+        let text = "--- !u!114 &11400000
+MonoBehaviour:
+  m_Name: TimelineAsset
+--- !u!114 &-7938135556022269506
+MonoBehaviour:
+  m_Name: 'Animation Track (1)'
+--- !u!1 &111111
+GameObject:
+  m_Name: '@SomeGo'
+--- !u!74 &-444444
+AnimationClip:
+  m_Name: EmbeddedClip
+";
+        let info = parse(text, ParseMode::WithSubAssets).unwrap();
+        // 3 named sub-docs (the class-114 top doc is the parent, not a sub).
+        // The line-oriented parser preserves YAML quote literals — Unity's
+        // typical output uses single-quoted strings for names with special
+        // chars; the sanitize / strip-quote pass happens downstream.
+        assert_eq!(info.sub_assets.len(), 3);
+        assert_eq!(info.sub_assets[0].name, "'Animation Track (1)'");
+        assert_eq!(info.sub_assets[1].name, "'@SomeGo'");
+        assert_eq!(info.sub_assets[2].name, "EmbeddedClip");
+    }
 }

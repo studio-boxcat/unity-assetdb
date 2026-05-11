@@ -77,6 +77,26 @@ fn is_embedded_container(hint: &str) -> bool {
         .is_some_and(|ext| EMBEDDED_CONTAINER_EXTS.contains(&ext))
 }
 
+/// True when `class_id` is a structural sub-doc that should be filtered
+/// out at parse time for the given container extension.
+///
+/// `.prefab`: GO / Transform / RectTransform / MonoBehaviour are all
+/// part of the GameObject tree — never addressable as sub-assets.
+/// `.controller` / `.anim` / `.mixer` / `.playable`: MonoBehaviour-114
+/// docs ARE addressable sub-assets (Timeline tracks, AudioMixerGroup,
+/// etc.) — only filter the GO-tree triplet, which doesn't appear in
+/// these files anyway (the predicate is a no-op there but stays valid
+/// for future-proofing).
+fn is_filterable_subdoc_for_ext(class_id: u32, ext: &str) -> bool {
+    let cls = ClassId::from_raw(class_id);
+    let is_go_tree = matches!(
+        cls,
+        Some(ClassId::GameObject | ClassId::Transform | ClassId::RectTransform)
+    );
+    let is_component = matches!(cls, Some(ClassId::MonoBehaviour));
+    is_go_tree || (is_component && ext == "prefab")
+}
+
 /// Convert `SystemTime` → ns-since-UNIX. Saturates to 0 on pre-epoch
 /// (which would only happen if the user's clock is bogus).
 fn mtime_ns(t: SystemTime) -> u64 {
@@ -465,13 +485,17 @@ fn process_one(
         top_class_id = info.top_class_id;
         script_guid = info.script_guid;
         for s in info.sub_assets {
-            if !s.name.is_empty() {
-                sub_assets.push(SubAsset {
-                    file_id: s.file_id,
-                    class_id: s.class_id,
-                    name: s.name.into_boxed_str(),
-                });
+            if s.name.is_empty() {
+                continue;
             }
+            if is_filterable_subdoc_for_ext(s.class_id, ext) {
+                continue;
+            }
+            sub_assets.push(SubAsset {
+                file_id: s.file_id,
+                class_id: s.class_id,
+                name: s.name.into_boxed_str(),
+            });
         }
     }
 
@@ -990,6 +1014,36 @@ mod tests {
         // non-texture asset (or a stale .meta missing the fields).
         let m = meta_for(None, None, vec![]);
         assert!(synthesize_implicit_sprite(&m, "Icon").is_none());
+    }
+
+    /// `is_filterable_subdoc_for_ext` is the single point where parse-
+    /// time sub-asset filtering decides what's a structural prefab tree
+    /// doc vs. a real sub-asset. Pin the contract per extension.
+    #[test]
+    fn is_filterable_subdoc_for_ext_branches_correctly() {
+        // .prefab: GO + Transform + RectTransform + MonoBehaviour-as-component.
+        for cls in [1, 4, 224, 114] {
+            assert!(
+                is_filterable_subdoc_for_ext(cls, "prefab"),
+                "class {cls} should be filtered for .prefab",
+            );
+        }
+        // .playable: Timeline tracks live as MB-114 — must NOT filter.
+        // GO/Transform never appear in .playable but the predicate stays
+        // valid (no-op).
+        assert!(!is_filterable_subdoc_for_ext(114, "playable"));
+        assert!(is_filterable_subdoc_for_ext(1, "playable"));
+        // .controller: AnimatorState (1102), BlendTree (206) — never
+        // filtered.
+        assert!(!is_filterable_subdoc_for_ext(1102, "controller"));
+        assert!(!is_filterable_subdoc_for_ext(114, "controller"));
+        // .mixer: AudioMixerGroup (273) — never filtered.
+        assert!(!is_filterable_subdoc_for_ext(273, "mixer"));
+        assert!(!is_filterable_subdoc_for_ext(114, "mixer"));
+        // .asset / .spriteatlas: MB-114 are real ScriptableObject sub-
+        // assets. Real classes (Sprite=213) are never filtered either.
+        assert!(!is_filterable_subdoc_for_ext(114, "asset"));
+        assert!(!is_filterable_subdoc_for_ext(213, "spriteatlas"));
     }
 
     #[test]

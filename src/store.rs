@@ -40,7 +40,13 @@ use crate::class_id::ClassId;
 ///      `asset_type` — type-aware reverse lookup discriminates at query
 ///      time. See [Name collisions](docs/asset-database.md#name-collisions).
 ///   Pre-v5 bakes are unreadable; re-bake required after upgrading.
-pub const SCHEMA_VERSION: u16 = 5;
+/// - v6: `.prefab`/`.controller`/`.anim`/`.mixer`/`.playable` sub-asset
+///   rows now exclude the GameObject-tree structural classes (GameObject,
+///   Transform, RectTransform, MonoBehaviour-as-component scoped to
+///   `.prefab` only). Pre-v6 caches carry leaked `'@<name>'` sub-asset
+///   rows for child GOs that would re-emerge on warm bakes; the bump
+///   invalidates them.
+pub const SCHEMA_VERSION: u16 = 6;
 
 /// File magic — first 8 bytes. `b"UADBIN__"`.
 pub const MAGIC: [u8; 8] = *b"UADBIN__";
