@@ -27,6 +27,12 @@ unity-assetdb bake [--project <path>] [--out-dir <path>]
 Without `--project`, walks up from the cwd until both `Assets/` and `ProjectSettings/`
 are found. Without `--out-dir`, writes to `<project>/Library/unity-assetdb/`.
 
+## Profiling
+
+`just profile` (hyperfine cold/warm + phase breakdown) and `just
+profile-flamegraph` (samply). See [`docs/profiling.md`](docs/profiling.md)
+for baseline numbers and per-phase semantics.
+
 ## Status
 
 - **API stability:** pre-1.0; signatures may shift.
