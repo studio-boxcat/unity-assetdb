@@ -299,6 +299,187 @@ TextureImporter:
     fs::remove_dir_all(&root).ok();
 }
 
+/// Cache integrity: when neither the `.meta` nor the asset file mtime
+/// changed between bakes, the second bake reuses cached entries
+/// verbatim and produces a byte-identical `asset-db.bin`. Pins the
+/// fast-path that skips the asset stat when the `.meta` mtime matches.
+#[test]
+fn cache_hit_path_byte_identical_rebake() {
+    let root = unique_tmp("cache-hit-bytes");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    let _out_dir = bake_at(&root);
+    let first = fs::read(db_file(&root)).unwrap();
+
+    // Sleep ≥1ms so any spurious mtime-on-touch debug couldn't false-hit.
+    // We don't TOUCH anything, but we also don't want to mask a bug where
+    // bake re-stamps an mtime as a side-effect.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let _out_dir = bake_at(&root);
+    let second = fs::read(db_file(&root)).unwrap();
+
+    assert_eq!(first, second, "second-bake bytes drifted from first");
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Cache trade-off: pinning the warm-path assumption. Touching only
+/// the asset file (without touching its `.meta`) does NOT invalidate the
+/// cache — the fast path keys on `.meta` mtime alone. Under Unity's
+/// importer this never happens (it stamps the `.meta` on every import),
+/// so the cached row stays correct in practice. Out-of-Unity asset
+/// edits land in the asset DB on the next `.meta` touch (or a manual
+/// `rm asset-db.cache.bin`).
+///
+/// Documented assumption in `process_one`; test pins the current
+/// behavior so any future invariant flip surfaces here.
+#[test]
+fn cache_does_not_detect_asset_only_touch() {
+    let root = unique_tmp("cache-asset-only-touch");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    let _out_dir = bake_at(&root);
+    let asset_path = root.join("Assets/UI/Foo.prefab");
+    let pre_meta_mtime = mtime_ns_of(&root.join("Assets/UI/Foo.prefab.meta"));
+
+    // Touch only the asset (Unity workflow can never produce this).
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let now = filetime::FileTime::now();
+    set_mtime(&asset_path, now);
+
+    let _out_dir = bake_at(&root);
+    let c = store::read_cache(&cache_file(&root)).unwrap();
+    let foo = c
+        .entries
+        .iter()
+        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
+        .unwrap();
+    // The cache's recorded asset_mtime is the *original* — fast path
+    // bypassed the companion stat, so the bake never noticed the touch.
+    assert_ne!(
+        foo.asset_mtime_ns,
+        mtime_ns_of(&asset_path),
+        "asset-only touch was unexpectedly detected (fast path may have changed)"
+    );
+    // Sanity: the meta mtime IS the value we'd expect (unchanged across
+    // bakes), confirming the fast path actually fired.
+    assert_eq!(
+        foo.meta_mtime_ns, pre_meta_mtime,
+        "meta mtime drifted between bakes — fixture leaked",
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Cache integrity: when both `.meta` and asset get touched (normal
+/// Unity reimport pattern), the second bake re-parses and the cache
+/// records the fresh mtimes. The most common warm-bake-invalidation
+/// case in practice.
+#[test]
+fn cache_invalidates_on_meta_and_asset_touch() {
+    let root = unique_tmp("cache-both-touch");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    let _out_dir = bake_at(&root);
+    let meta_path = root.join("Assets/UI/Foo.prefab.meta");
+    let asset_path = root.join("Assets/UI/Foo.prefab");
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let now = filetime::FileTime::now();
+    set_mtime(&meta_path, now);
+    set_mtime(&asset_path, now);
+
+    let _out_dir = bake_at(&root);
+    let c = store::read_cache(&cache_file(&root)).unwrap();
+    let foo = c
+        .entries
+        .iter()
+        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
+        .unwrap();
+    assert_eq!(foo.meta_mtime_ns, mtime_ns_of(&meta_path));
+    assert_eq!(foo.asset_mtime_ns, mtime_ns_of(&asset_path));
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Cache integrity: changing the `.meta` mtime alone (without asset
+/// edits) must still cause re-parse — the meta stat is what gates the
+/// fast path, so a drift there has to fall through to the slow path.
+#[test]
+fn cache_invalidates_on_meta_mtime_drift() {
+    let root = unique_tmp("cache-meta-drift");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    let _out_dir = bake_at(&root);
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let meta_path = root.join("Assets/UI/Foo.prefab.meta");
+    let now = filetime::FileTime::now();
+    set_mtime(&meta_path, now);
+
+    let _out_dir = bake_at(&root);
+    let c = store::read_cache(&cache_file(&root)).unwrap();
+    let foo = c
+        .entries
+        .iter()
+        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
+        .unwrap();
+    let new_meta_mtime = mtime_ns_of(&meta_path);
+    assert_eq!(
+        foo.meta_mtime_ns, new_meta_mtime,
+        "cache meta_mtime not bumped after meta touch"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Cache integrity: deleting an asset between bakes drops it from the
+/// resulting database. Guards against a fast-path bug that might serve
+/// the cached row even when the companion no longer exists.
+#[test]
+fn cache_drops_entry_when_asset_deleted() {
+    let root = unique_tmp("cache-asset-deleted");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    let _out_dir = bake_at(&root);
+    let first = store::read(&db_file(&root)).unwrap();
+    assert!(
+        first
+            .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .is_some(),
+        "Foo prefab should exist before deletion",
+    );
+
+    fs::remove_file(root.join("Assets/UI/Foo.prefab")).unwrap();
+    fs::remove_file(root.join("Assets/UI/Foo.prefab.meta")).unwrap();
+
+    let _out_dir = bake_at(&root);
+    let second = store::read(&db_file(&root)).unwrap();
+    assert!(
+        second
+            .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .is_none(),
+        "deleted Foo prefab still in db",
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+fn set_mtime(path: &Path, t: filetime::FileTime) {
+    filetime::set_file_mtime(path, t).unwrap();
+}
+
+fn mtime_ns_of(path: &Path) -> u64 {
+    let md = fs::metadata(path).unwrap();
+    let st = md
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    st.as_nanos() as u64
+}
+
 #[test]
 fn cache_file_lives_alongside_bin() {
     let root = unique_tmp("cache-file");

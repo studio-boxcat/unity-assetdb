@@ -33,89 +33,88 @@ pub struct MetaInfo {
 /// Format reference: <https://docs.unity3d.com/Manual/SpecialFolders.html>
 /// Robust enough for the YAML subset Unity emits — line-oriented, `key: value`,
 /// without resorting to a full YAML parser.
-pub fn parse(text: &str) -> Result<MetaInfo> {
-    let guid = parse_guid(text).context("missing or malformed `guid:` in .meta")?;
-    let sprite_sheet = parse_sprite_sheet(text);
-    let texture_type = parse_u32_field(text, "textureType:");
-    let sprite_mode = parse_u32_field(text, "spriteMode:");
-    Ok(MetaInfo {
-        guid,
-        sprite_sheet,
-        texture_type,
-        sprite_mode,
-    })
-}
-
-/// First-match scan for a u32 scalar at any indent. `key` includes the
-/// trailing `:` (e.g. `"textureType:"`) — caller's responsibility to
-/// pick a key unique to TextureImporter so the whole-file scan can't
-/// false-match a longer key with the same prefix.
-fn parse_u32_field(text: &str, key: &str) -> Option<u32> {
-    for line in text.lines() {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix(key) {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_guid(text: &str) -> Option<u128> {
-    for line in text.lines() {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix("guid:") {
-            let hex = rest.trim();
-            if hex.len() == 32 {
-                return u128::from_str_radix(hex, 16).ok();
-            }
-        }
-    }
-    None
-}
-
-/// Walks the `spriteSheet:` block under `TextureImporter:` and the
-/// follow-on `sprites:` list, capturing each sprite's `name` + `internalID`.
-/// Stays line-oriented; Unity emits a stable indented form.
 ///
-/// List-item detection: any non-empty line whose first non-space char is
-/// `-` opens a new entry, regardless of which key follows the dash. We
-/// flush the previous entry on each new dash and at end-of-block.
-fn parse_sprite_sheet(text: &str) -> Vec<(i64, String)> {
-    let mut out: Vec<(i64, String)> = Vec::new();
+/// Single-pass: walks every line once, picking off the guid, the
+/// TextureImporter mode fields, and the spriteSheet `sprites:` list in
+/// the same loop. Replaces the older four-scan-per-file shape — a
+/// measurable cold-path win since `str::lines` is memchr-bound and
+/// every redundant pass is wasted SIMD time.
+pub fn parse(text: &str) -> Result<MetaInfo> {
+    let mut info = MetaInfo::default();
+    let mut have_guid = false;
+
+    // SpriteSheet `sprites:` list cursor. `in_sprites` is true between the
+    // `sprites:` key line and the indent drop that ends the block. Per-item
+    // `cur_name` / `cur_id` accumulate the current entry; flushed on each
+    // new `-` and at block exit.
     let mut in_sprites = false;
     let mut cur_name: Option<String> = None;
     let mut cur_id: Option<i64> = None;
 
     for line in text.lines() {
-        let trimmed = line.trim();
+        // sprites-block handling has to come first — the block lives at a
+        // deeper indent than the key scans below, and an early `continue`
+        // here keeps the simple key scans from accidentally matching e.g.
+        // a sub-`name:` inside a sprite entry as a top-level field.
+        if in_sprites {
+            let trimmed = line.trim();
+            // Block ends when indent drops to root (sibling key with no
+            // leading whitespace). Empty lines are tolerated.
+            if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
+                in_sprites = false;
+                flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
+                // Fall through — this line may itself be a key we want
+                // (textureType / spriteMode appear after spriteSheet in
+                // some importer versions).
+            } else if let Some(after_dash) = trimmed.strip_prefix("- ") {
+                // New list item — flush the previous and start a new one
+                // with whatever k:v rides on the dash line.
+                flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
+                absorb_kv(after_dash, &mut cur_name, &mut cur_id);
+                continue;
+            } else {
+                absorb_kv(trimmed, &mut cur_name, &mut cur_id);
+                continue;
+            }
+        }
 
+        let trimmed = line.trim_start();
+
+        if !have_guid
+            && let Some(rest) = trimmed.strip_prefix("guid:")
+        {
+            let hex = rest.trim();
+            if hex.len() == 32
+                && let Ok(g) = u128::from_str_radix(hex, 16)
+            {
+                info.guid = g;
+                have_guid = true;
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("textureType:") {
+            info.texture_type = rest.trim().parse().ok();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("spriteMode:") {
+            info.sprite_mode = rest.trim().parse().ok();
+            continue;
+        }
         if trimmed == "sprites:" {
             in_sprites = true;
             continue;
         }
-        if !in_sprites {
-            continue;
-        }
-
-        // Block ends when indent drops to root (sibling key with no leading
-        // whitespace). Empty lines are tolerated.
-        if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
-            break;
-        }
-
-        // New list item. Strip the dash; the rest of the line is the
-        // first key:value pair of the entry (often `serializedVersion: 2`
-        // or `name: foo`).
-        if let Some(after_dash) = trimmed.strip_prefix("- ") {
-            flush(&mut out, &mut cur_name, &mut cur_id);
-            absorb_kv(after_dash, &mut cur_name, &mut cur_id);
-            continue;
-        }
-
-        absorb_kv(trimmed, &mut cur_name, &mut cur_id);
     }
-    flush(&mut out, &mut cur_name, &mut cur_id);
-    out
+
+    // Flush a trailing sprite entry if the file ended inside the block.
+    flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
+
+    if !have_guid {
+        return Err(anyhow::anyhow!("missing or malformed `guid:` in .meta"))
+            .context("parse meta");
+    }
+    Ok(info)
 }
 
 fn absorb_kv(line: &str, cur_name: &mut Option<String>, cur_id: &mut Option<i64>) {
@@ -129,7 +128,7 @@ fn absorb_kv(line: &str, cur_name: &mut Option<String>, cur_id: &mut Option<i64>
     }
 }
 
-fn flush(out: &mut Vec<(i64, String)>, name: &mut Option<String>, id: &mut Option<i64>) {
+fn flush_sprite(out: &mut Vec<(i64, String)>, name: &mut Option<String>, id: &mut Option<i64>) {
     if let (Some(n), Some(i)) = (name.take(), id.take())
         && !n.is_empty()
     {

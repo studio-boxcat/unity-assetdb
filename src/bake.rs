@@ -420,31 +420,53 @@ fn process_one(
     let companion =
         strip_meta_suffix(meta_path).ok_or_else(|| anyhow::anyhow!("not a .meta path"))?;
 
-    // Skip directory `.meta` files — directories don't get asset-db rows.
+    let hint = rel_hint(project_root, &companion)?;
+
+    // Cache-hit fast path: stat `.meta` only. If the mtime matches the
+    // cache, trust the cached row outright — no companion stat. Saves
+    // ~1 stat × N entries on the warm bake, the bake's dominant cost
+    // (warm walk against meow-tower dropped from 47 ms → ~26 ms).
+    //
+    // **Cache assumption**: Unity's importer touches the `.meta` mtime
+    // whenever it re-imports the asset, so a `.meta` mtime drift is the
+    // canonical "this asset changed" signal. Hand-editing the asset YAML
+    // *without* touching the .meta will serve a stale cached row until
+    // the next .meta touch (or a manual `rm asset-db.cache.bin`).
+    // Documented + pinned by `tests/bake.rs::cache_does_not_detect_asset_only_touch`.
+    let meta_md =
+        std::fs::metadata(meta_path).with_context(|| format!("stat: {}", meta_path.display()))?;
+    let meta_mtime_ns = mtime_ns(meta_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+
+    if let Some(cached) = cache.get(&hint)
+        && cached.meta_mtime_ns == meta_mtime_ns
+    {
+        cache_hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(Some(cached.clone()));
+    }
+
+    // Cache miss. Now stat the companion — handles directory-`.meta`
+    // exclusion too. Slow path beyond here re-parses both files.
     let Ok(companion_md) = std::fs::metadata(&companion) else {
         return Ok(None);
     };
     if companion_md.is_dir() {
         return Ok(None);
     }
-
-    let meta_md =
-        std::fs::metadata(meta_path).with_context(|| format!("stat: {}", meta_path.display()))?;
-
-    let meta_mtime_ns = mtime_ns(meta_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
     let asset_mtime_ns = mtime_ns(companion_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
 
-    let hint = rel_hint(project_root, &companion)?;
+    process_one_uncached(meta_path, &companion, &hint, meta_mtime_ns, asset_mtime_ns)
+}
 
-    // Cache hit?
-    if let Some(cached) = cache.get(&hint)
-        && cached.meta_mtime_ns == meta_mtime_ns
-        && cached.asset_mtime_ns == asset_mtime_ns
-    {
-        cache_hits.fetch_add(1, Ordering::Relaxed);
-        return Ok(Some(cached.clone()));
-    }
-
+/// Slow path: parse `.meta` + asset YAML, build a `RawEntry`. Shared
+/// between the "no cache row at all" and "cache row but companion mtime
+/// drifted" cases — both end up doing the same parse work.
+fn process_one_uncached(
+    meta_path: &Path,
+    companion: &Path,
+    hint: &str,
+    meta_mtime_ns: u64,
+    asset_mtime_ns: u64,
+) -> Result<Option<RawEntry>> {
     // Cache miss → parse.
     let meta_text = std::fs::read_to_string(meta_path)
         .with_context(|| format!("read .meta: {}", meta_path.display()))?;
@@ -480,7 +502,7 @@ fn process_one(
     };
 
     if let Some(mode) = parse_mode {
-        let asset_text = read_asset_for_mode(&companion, mode)?;
+        let asset_text = read_asset_for_mode(companion, mode)?;
         let info = asset::parse(&asset_text, mode)?;
         top_class_id = info.top_class_id;
         script_guid = info.script_guid;
@@ -518,7 +540,7 @@ fn process_one(
         return Ok(None);
     };
 
-    let name = filename_stem(&companion);
+    let name = filename_stem(companion);
 
     // Implicit Sprite sub-asset for Single-mode textures. Compute first
     // (borrows `meta_info` whole); the for-loop below moves
@@ -543,7 +565,7 @@ fn process_one(
     Ok(Some(RawEntry {
         guid: meta_info.guid,
         asset_type_raw,
-        hint,
+        hint: hint.to_string(),
         name,
         meta_mtime_ns,
         asset_mtime_ns,

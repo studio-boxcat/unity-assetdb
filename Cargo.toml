@@ -32,3 +32,9 @@ anyhow = "1"
 bincode = "2"
 ignore = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
+
+[dev-dependencies]
+# `filetime` exposes a portable `set_file_mtime` for the cache-integrity
+# tests in tests/bake.rs — we need to drift mtimes on demand to exercise
+# the warm-path fast/slow-path bake branches.
+filetime = "0.2"
