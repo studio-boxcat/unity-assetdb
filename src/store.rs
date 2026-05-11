@@ -139,17 +139,47 @@ impl AssetDb {
         Some(&self.entries[idx])
     }
 
+    /// O(n) scan by hint (project-relative path). Used by `register` and
+    /// the `guid <path>` CLI lookup. Linear because `entries` is sorted by
+    /// guid, not hint — a secondary index would cost ~hundreds of KB of
+    /// transient state per query for an op that runs once per CLI
+    /// invocation.
+    pub fn find_by_hint(&self, hint: &str) -> Option<&AssetEntry> {
+        self.entries.iter().find(|e| &*e.hint == hint)
+    }
+
+    /// Binary-search insert by guid; overwrites on collision. Caller
+    /// must ensure `AssetType::Script(idx)` references a valid
+    /// `script_types` slot (see [`Self::intern_script`]).
+    pub fn insert_sorted(&mut self, entry: AssetEntry) {
+        match self.entries.binary_search_by_key(&entry.guid, |e| e.guid) {
+            Ok(idx) => self.entries[idx] = entry,
+            Err(idx) => self.entries.insert(idx, entry),
+        }
+    }
+
     /// Resolve `AssetType::Script(idx)` to its underlying script GUID.
     /// Panics on out-of-range idx — that's a corrupt-file error, fail loud.
     pub fn script_guid(&self, idx: u32) -> u128 {
         self.script_types[idx as usize]
     }
 
-    /// Bake-side intern: returns the index of `guid`, inserting if new.
+    /// Intern `guid` and return its index. On sorted insertion, remaps
+    /// existing entries' `AssetType::Script(i ≥ idx)` so prior indices
+    /// stay valid. Bake's hot path has `entries.is_empty()`, so the
+    /// remap is a no-op there; register relies on it to keep an
+    /// incremental update coherent.
     pub fn intern_script(&mut self, guid: u128) -> u32 {
         match self.script_types.binary_search(&guid) {
             Ok(idx) => idx as u32,
             Err(idx) => {
+                for entry in &mut self.entries {
+                    if let AssetType::Script(i) = &mut entry.asset_type
+                        && *i as usize >= idx
+                    {
+                        *i += 1;
+                    }
+                }
                 self.script_types.insert(idx, guid);
                 idx as u32
             }
@@ -214,6 +244,14 @@ impl BakeCache {
             ..Default::default()
         }
     }
+
+    /// Binary-search insert by hint; overwrites on collision.
+    pub fn insert_sorted(&mut self, entry: CachedEntry) {
+        match self.entries.binary_search_by(|e| e.hint.cmp(&entry.hint)) {
+            Ok(idx) => self.entries[idx] = entry,
+            Err(idx) => self.entries.insert(idx, entry),
+        }
+    }
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────
@@ -224,6 +262,11 @@ pub const DB_FILENAME: &str = "asset-db.bin";
 /// Bake-only mtime cache filename. Sibling to [`DB_FILENAME`].
 pub const CACHE_FILENAME: &str = "asset-db.cache.bin";
 
+/// Advisory-lock filename. `bake` and `register` flock this to serialize
+/// db rewrites — registration of a new asset must not race a parallel
+/// walk that's about to overwrite `asset-db.bin`.
+pub const LOCK_FILENAME: &str = ".asset-db.lock";
+
 /// `<dir>/asset-db.bin`. Caller composes the directory convention
 /// (e.g. `<project>/Library/unity-assetdb/`).
 pub fn db_path(dir: &Path) -> PathBuf {
@@ -233,6 +276,83 @@ pub fn db_path(dir: &Path) -> PathBuf {
 /// `<dir>/asset-db.cache.bin`. Sibling to [`db_path`].
 pub fn cache_path(dir: &Path) -> PathBuf {
     dir.join(CACHE_FILENAME)
+}
+
+/// `<dir>/.asset-db.lock`. Sibling to [`db_path`].
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join(LOCK_FILENAME)
+}
+
+/// How [`acquire_lock`] waits when the lock is contended.
+pub enum LockWait {
+    /// Try once; return `WouldBlock` immediately on contention.
+    TryOnce,
+    /// Block until acquired (native blocking flock).
+    Forever,
+    /// Poll with 50 ms ticks until acquired or `Duration` elapses.
+    Until(std::time::Duration),
+}
+
+/// Acquire an exclusive advisory flock on `<dir>/.asset-db.lock`. Returns
+/// a guard that releases on drop. Shared by bake and register.
+pub fn acquire_lock(dir: &Path, wait: LockWait) -> Result<LockGuard, StoreError> {
+    let path = lock_path(dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| StoreError::Io {
+            op: "open lock",
+            path: path.clone(),
+            source,
+        })?;
+    let io_err = |op, source| StoreError::Io {
+        op,
+        path: path.clone(),
+        source,
+    };
+    match wait {
+        LockWait::TryOnce => {
+            fs2::FileExt::try_lock_exclusive(&file).map_err(|e| io_err("try-lock", e))?;
+        }
+        LockWait::Forever => {
+            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_err("lock", e))?;
+        }
+        LockWait::Until(timeout) => {
+            let start = std::time::Instant::now();
+            let tick = std::time::Duration::from_millis(50);
+            loop {
+                if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
+                    break;
+                }
+                if start.elapsed() >= timeout {
+                    return Err(io_err(
+                        "lock timeout",
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!("could not acquire lock after {timeout:?}"),
+                        ),
+                    ));
+                }
+                std::thread::sleep(tick);
+            }
+        }
+    }
+    Ok(LockGuard { file })
+}
+
+/// RAII guard for the advisory flock acquired by [`acquire_lock`]. POSIX
+/// flock releases on FD close; the explicit unlock here is belt-and-braces.
+pub struct LockGuard {
+    file: std::fs::File,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────
@@ -363,6 +483,11 @@ fn check_magic<'a>(
     Ok(body)
 }
 
+/// Atomic write: stage payload at `<path>.tmp.<pid>`, then `rename` over
+/// the destination. Concurrent readers always see either the old or the
+/// new bytes; a process crash mid-write leaves the prior file intact.
+/// Mitigates the "register clobbers a mid-flight bake" race that the
+/// advisory flock on the out_dir is the primary defense against.
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
@@ -371,10 +496,23 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
             source,
         })?;
     }
-    std::fs::write(path, bytes).map_err(|source| StoreError::Io {
-        op: "write",
-        path: path.to_path_buf(),
+    let tmp = {
+        let mut t = path.as_os_str().to_owned();
+        t.push(format!(".tmp.{}", std::process::id()));
+        std::path::PathBuf::from(t)
+    };
+    std::fs::write(&tmp, bytes).map_err(|source| StoreError::Io {
+        op: "write tmp",
+        path: tmp.clone(),
         source,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        StoreError::Io {
+            op: "rename",
+            path: path.to_path_buf(),
+            source,
+        }
     })?;
     Ok(())
 }

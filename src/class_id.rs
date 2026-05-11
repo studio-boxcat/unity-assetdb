@@ -133,6 +133,49 @@ impl ClassId {
         }
     }
 
+    /// Reverse of [`Self::name`]. Case-sensitive (canonical PascalCase).
+    /// **Must be kept in sync with `name()`** when adding a variant —
+    /// the catch-all arm here defeats the compiler's exhaustiveness check.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "GameObject" => Self::GameObject,
+            "Transform" => Self::Transform,
+            "Material" => Self::Material,
+            "Texture2D" => Self::Texture2D,
+            "Mesh" => Self::Mesh,
+            "Shader" => Self::Shader,
+            "TextAsset" => Self::TextAsset,
+            "PhysicsMaterial2D" => Self::PhysicsMaterial2D,
+            "AnimationClip" => Self::AnimationClip,
+            "AudioClip" => Self::AudioClip,
+            "RenderTexture" => Self::RenderTexture,
+            "Cubemap" => Self::Cubemap,
+            "Avatar" => Self::Avatar,
+            "AnimatorController" => Self::AnimatorController,
+            "MonoBehaviour" => Self::MonoBehaviour,
+            "MonoScript" => Self::MonoScript,
+            "Texture3D" => Self::Texture3D,
+            "Font" => Self::Font,
+            "PhysicMaterial" => Self::PhysicMaterial,
+            "TerrainData" => Self::TerrainData,
+            "Sprite" => Self::Sprite,
+            "AnimatorOverrideController" => Self::AnimatorOverrideController,
+            "AudioMixerController" => Self::AudioMixerController,
+            "RectTransform" => Self::RectTransform,
+            "NavMeshData" => Self::NavMeshData,
+            "Prefab" => Self::Prefab,
+            "PrefabImporter" => Self::PrefabImporter,
+            "AvatarMask" => Self::AvatarMask,
+            "SceneAsset" => Self::SceneAsset,
+            "LightingDataAsset" => Self::LightingDataAsset,
+            "AssemblyDefinitionAsset" => Self::AssemblyDefinitionAsset,
+            "AssemblyDefinitionReferenceAsset" => Self::AssemblyDefinitionReferenceAsset,
+            "SpriteAtlas" => Self::SpriteAtlas,
+            "LightingSettings" => Self::LightingSettings,
+            _ => return None,
+        })
+    }
+
     /// Canonical sub-object fileID Unity assigns to a single embedded
     /// asset of this class. Encoding: `class_id × 100_000`. Stays in
     /// this module per the project's "no magic numbers" rule (file

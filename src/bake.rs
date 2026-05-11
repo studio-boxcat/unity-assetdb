@@ -146,6 +146,27 @@ enum AssetTypeRaw {
     Script(u128),
 }
 
+/// Public, dedup-free view of a single parsed asset — what [`parse_one`]
+/// returns. Script GUIDs are unmapped; caller calls
+/// [`crate::store::AssetDb::intern_script`].
+#[derive(Debug, Clone)]
+pub struct ParsedEntry {
+    pub guid: u128,
+    pub asset_type: ParsedAssetType,
+    pub hint: String,
+    /// Raw filename stem — no dedup, no sanitizer applied.
+    pub name: String,
+    pub meta_mtime_ns: u64,
+    pub asset_mtime_ns: u64,
+    pub sub_assets: Vec<SubAsset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedAssetType {
+    Native(u32),
+    Script(u128),
+}
+
 /// Per-worker-thread accumulator. Sends its collected `entries` + `errors`
 /// to the main thread via Drop — `ignore::WalkBuilder::run` drops each
 /// thread's visitor closure (and thus its captured `ThreadLocal`) on
@@ -294,18 +315,7 @@ pub struct BakeOptions {
 /// Bake entry-point. Walks `Assets/`, parses `.meta` + asset YAML,
 /// writes `<out_dir>/asset-db.bin` and `<out_dir>/asset-db.cache.bin`.
 pub fn bake(opts: &BakeOptions) -> Result<(), BakeError> {
-    bake_inner(opts).map_err(|e| {
-        // Surface typed source errors when they bubbled up via `?`
-        // without context wrapping — consumers can match on
-        // `BakeError::Store` etc. Otherwise fall through to `Other`.
-        match e.downcast::<StoreError>() {
-            Ok(s) => return BakeError::Store(s),
-            Err(e) => match e.downcast::<WalkError>() {
-                Ok(w) => return BakeError::Walk(w),
-                Err(e) => BakeError::Other(e),
-            },
-        }
-    })
+    bake_inner(opts).map_err(map_bake_err)
 }
 
 fn bake_inner(opts: &BakeOptions) -> Result<()> {
@@ -314,6 +324,12 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
         .with_context(|| format!("create out-dir: {}", opts.out_dir.display()))?;
     let db_file = opts.out_dir.join(DB_FILENAME);
     let cache_file = opts.out_dir.join(CACHE_FILENAME);
+
+    // Advisory flock on `<out_dir>/.asset-db.lock` — shared with
+    // `register` so concurrent invocations don't clobber bin/cache.
+    let _lock = store::acquire_lock(&opts.out_dir, store::LockWait::Forever)
+        .with_context(|| format!("lock: {}", opts.out_dir.display()))?;
+
     let t_start = Instant::now();
 
     // Load bake-only cache. Missing/corrupt → empty (first bake or stale).
@@ -440,6 +456,69 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Single-asset parse, callable outside the parallel walk.
+///
+/// Stats `meta_path` + its companion file, parses both, returns the same
+/// shape `bake` would produce for this asset (sans dedup and sans
+/// post-walk `script_types` interning).
+///
+/// Returns `Ok(None)` when the meta has no companion to describe
+/// (orphaned `.meta`, directory `.meta`).
+///
+/// Used by `register` to compute the entry to insert into an existing
+/// `AssetDb` after synthesizing a new `.meta`. See [`crate::register`].
+pub fn parse_one(
+    project_root: &Path,
+    meta_path: &Path,
+) -> Result<Option<ParsedEntry>, BakeError> {
+    parse_one_inner(project_root, meta_path).map_err(map_bake_err)
+}
+
+fn parse_one_inner(project_root: &Path, meta_path: &Path) -> Result<Option<ParsedEntry>> {
+    let companion =
+        strip_meta_suffix(meta_path).ok_or_else(|| anyhow::anyhow!("not a .meta path"))?;
+    let hint = rel_hint(project_root, &companion)?;
+    let meta_md =
+        std::fs::metadata(meta_path).with_context(|| format!("stat: {}", meta_path.display()))?;
+    let meta_mtime_ns = mtime_ns(meta_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+    let Ok(companion_md) = std::fs::metadata(&companion) else {
+        return Ok(None);
+    };
+    if companion_md.is_dir() {
+        return Ok(None);
+    }
+    let asset_mtime_ns = mtime_ns(companion_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+    let raw = process_one_uncached(meta_path, &companion, &hint, meta_mtime_ns, asset_mtime_ns)?;
+    Ok(raw.map(raw_to_parsed))
+}
+
+fn raw_to_parsed(r: RawEntry) -> ParsedEntry {
+    ParsedEntry {
+        guid: r.guid,
+        asset_type: match r.asset_type_raw {
+            AssetTypeRaw::Native(n) => ParsedAssetType::Native(n),
+            AssetTypeRaw::Script(g) => ParsedAssetType::Script(g),
+        },
+        hint: r.hint,
+        name: r.name,
+        meta_mtime_ns: r.meta_mtime_ns,
+        asset_mtime_ns: r.asset_mtime_ns,
+        sub_assets: r.sub_assets,
+    }
+}
+
+/// Surface `?`-propagated `StoreError` / `WalkError` as typed variants so
+/// consumers can match on them. Anything else falls through to `Other`.
+fn map_bake_err(e: anyhow::Error) -> BakeError {
+    match e.downcast::<StoreError>() {
+        Ok(s) => BakeError::Store(s),
+        Err(e) => match e.downcast::<WalkError>() {
+            Ok(w) => BakeError::Walk(w),
+            Err(e) => BakeError::Other(e),
+        },
+    }
 }
 
 /// Per-`.meta` work. Returns `Ok(None)` when the meta has no companion file
@@ -871,9 +950,17 @@ fn read_asset_for_mode(path: &Path, mode: asset::ParseMode) -> Result<String> {
     }
 }
 
-fn strip_meta_suffix(p: &Path) -> Option<PathBuf> {
+/// `Foo.png.meta` → `Foo.png`. None when `p` isn't a `.meta` path.
+pub fn strip_meta_suffix(p: &Path) -> Option<PathBuf> {
     let s = p.to_str()?;
     s.strip_suffix(".meta").map(PathBuf::from)
+}
+
+/// `Foo.png` → `Foo.png.meta`. Inverse of [`strip_meta_suffix`].
+pub fn with_meta_suffix(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".meta");
+    PathBuf::from(s)
 }
 
 fn rel_hint(project_root: &Path, companion: &Path) -> Result<String> {
