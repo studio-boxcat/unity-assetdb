@@ -494,17 +494,6 @@ fn process_one(
         return Ok(None);
     };
 
-    // Strip the parent's own canonical doc from `sub_assets`. Unity sorts
-    // YAML docs by hashed fileID, so for embedded-container files
-    // (`.controller`, `.prefab`, …) the *actual* top-level asset (at
-    // `file_id = class × 100_000`) often appears after another doc and
-    // lands in `info.sub_assets` via `asset::parse`'s doc-index-0
-    // heuristic. Without this filter, downstream consumers see a
-    // sub-asset row whose name equals the parent and whose fid is the
-    // canonical, then route parent-pointing PPtrs through `$Sub@Parent`
-    // instead of the bare `$Alias`. See `strip_self_doc_from_subassets`.
-    strip_self_doc_from_subassets(&mut sub_assets, asset_type_raw);
-
     let name = filename_stem(&companion);
 
     // Implicit Sprite sub-asset for Single-mode textures. Compute first
@@ -566,26 +555,6 @@ fn synthesize_implicit_sprite(meta: &meta::MetaInfo, stem: &str) -> Option<SubAs
     } else {
         None
     }
-}
-
-/// Strip sub-asset rows that actually represent the parent's own
-/// top-level Unity doc — `file_id = class × 100_000`, `class_id = parent
-/// class`. Called from `process_one` after the asset YAML peek.
-///
-/// `asset::parse` picks YAML doc index 0 as the bake "top doc", which is
-/// wrong for embedded-container files: Unity sorts docs by hashed file_id
-/// so the actual top-level Unity asset (at canonical fid) often appears
-/// later in the YAML and gets pushed into `info.sub_assets`. Encoders
-/// treating that row as a sub-asset emit `$Sub@Parent` for what's really
-/// a parent PPtr.
-///
-/// Only filters `AssetTypeRaw::Native` since the `class × 100_000`
-/// formula doesn't apply to `Script`-backed assets (their canonical fid
-/// is `MonoBehaviour × 100_000 = 11400000` regardless of the script).
-fn strip_self_doc_from_subassets(sub_assets: &mut Vec<SubAsset>, asset_type: AssetTypeRaw) {
-    let AssetTypeRaw::Native(n) = asset_type else { return };
-    let canonical_fid = (n as i64) * 100_000;
-    sub_assets.retain(|s| !(s.file_id == canonical_fid && s.class_id == n));
 }
 
 fn warn_sanitized(on_warn: Option<WarnSinkRef<'_>>, kind: &str, hint: &str, old: &str, new: &str) {
@@ -1021,74 +990,6 @@ mod tests {
         // non-texture asset (or a stale .meta missing the fields).
         let m = meta_for(None, None, vec![]);
         assert!(synthesize_implicit_sprite(&m, "Icon").is_none());
-    }
-
-    /// `.controller` files top with an AnimationClip or AnimatorState
-    /// in YAML doc order (Unity sorts by hashed fid); the real
-    /// AnimatorController doc lives at canonical fid `9100000` later in
-    /// the file. `asset::parse` lands it in `info.sub_assets` →
-    /// `strip_self_doc_from_subassets` must drop it so downstream
-    /// consumers don't treat the parent's own doc as an addressable
-    /// sub-asset.
-    #[test]
-    fn strip_self_doc_drops_canonical_native_row() {
-        let mut subs = vec![
-            SubAsset {
-                file_id: -4502558101186639578,
-                class_id: ClassId::AnimationClip as u32,
-                name: "Normal".into(),
-            },
-            SubAsset {
-                // (file_id, class_id) = (91 × 100_000, 91) → this IS the
-                // parent's canonical AnimatorController doc.
-                file_id: 9100000,
-                class_id: ClassId::AnimatorController as u32,
-                name: "Button_Normal".into(),
-            },
-            SubAsset {
-                file_id: 88418881146007920,
-                class_id: 1102, // AnimatorState
-                name: "Normal".into(),
-            },
-        ];
-        let parent = AssetTypeRaw::Native(ClassId::AnimatorController as u32);
-        strip_self_doc_from_subassets(&mut subs, parent);
-        // The canonical row is gone; the other two stay.
-        assert_eq!(subs.len(), 2);
-        assert!(!subs.iter().any(|s| s.file_id == 9100000));
-    }
-
-    /// Filter must not strip rows whose `(file_id, class_id)` only
-    /// partially match the parent. e.g. a Sprite sub-asset at fid
-    /// `21300000` inside a Texture2D parent: file_id == 213 × 100_000
-    /// but class_id == Sprite (213), parent class is Texture2D (28). The
-    /// row is a legitimate sub-asset, not the parent's self doc.
-    #[test]
-    fn strip_self_doc_preserves_unrelated_canonical_rows() {
-        let mut subs = vec![SubAsset {
-            file_id: 21300000,
-            class_id: ClassId::Sprite as u32,
-            name: "Icon".into(),
-        }];
-        let parent = AssetTypeRaw::Native(ClassId::Texture2D as u32);
-        strip_self_doc_from_subassets(&mut subs, parent);
-        assert_eq!(subs.len(), 1);
-    }
-
-    /// `Script(_)`-typed parents are skipped — the `class × 100_000`
-    /// canonical formula doesn't apply (their canonical fid is the
-    /// MonoBehaviour value `11400000` regardless of which script).
-    #[test]
-    fn strip_self_doc_noop_on_script_typed_parent() {
-        let mut subs = vec![SubAsset {
-            file_id: 11400000,
-            class_id: 114,
-            name: "Foo".into(),
-        }];
-        let parent = AssetTypeRaw::Script(0xdeadbeef_u128);
-        strip_self_doc_from_subassets(&mut subs, parent);
-        // Filter does nothing for Script parents.
-        assert_eq!(subs.len(), 1);
     }
 
     #[test]
