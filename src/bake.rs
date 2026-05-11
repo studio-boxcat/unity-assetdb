@@ -568,7 +568,6 @@ fn build_db(
         }
     }
 
-
     // Pass 1: tally every name's distinct-guid owners across both
     // top-level and sub-asset claims. A name owned by ≥2 distinct guids
     // is "contested" — every claimant must rename, no one keeps the bare
