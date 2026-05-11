@@ -4,7 +4,12 @@
 //! TextureImporter mode fields the bake needs to recognize Single-mode
 //! Sprite textures.
 
-use anyhow::{Context, Result};
+/// Errors from `.meta` parsing.
+#[derive(Debug, thiserror::Error)]
+pub enum MetaParseError {
+    #[error("missing or malformed `guid:` in .meta")]
+    MissingGuid,
+}
 
 /// `TextureImporter.textureType` enum — Unity only auto-generates a
 /// Sprite sub-object when the importer is in Sprite mode.
@@ -39,7 +44,7 @@ pub struct MetaInfo {
 /// the same loop. Replaces the older four-scan-per-file shape — a
 /// measurable cold-path win since `str::lines` is memchr-bound and
 /// every redundant pass is wasted SIMD time.
-pub fn parse(text: &str) -> Result<MetaInfo> {
+pub fn parse(text: &str) -> Result<MetaInfo, MetaParseError> {
     let mut info = MetaInfo::default();
     let mut have_guid = false;
 
@@ -106,8 +111,7 @@ pub fn parse(text: &str) -> Result<MetaInfo> {
     flush_sprite(&mut info.sprite_sheet, &mut cur_name, &mut cur_id);
 
     if !have_guid {
-        return Err(anyhow::anyhow!("missing or malformed `guid:` in .meta"))
-            .context("parse meta");
+        return Err(MetaParseError::MissingGuid);
     }
     Ok(info)
 }
@@ -261,9 +265,6 @@ TextureImporter:
     #[test]
     fn empty_file_errors_cleanly() {
         let err = parse("").unwrap_err();
-        // `{:#}` flattens the anyhow context chain so the inner
-        // "missing guid" message surfaces alongside the outer context.
-        let msg = format!("{err:#}");
-        assert!(msg.contains("guid"), "expected guid-missing error, got: {msg}");
+        assert!(matches!(err, MetaParseError::MissingGuid));
     }
 }

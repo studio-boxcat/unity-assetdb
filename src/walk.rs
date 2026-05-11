@@ -7,20 +7,41 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
 use ignore::WalkBuilder;
+
+/// Errors from walking the Unity project tree.
+#[derive(Debug, thiserror::Error)]
+pub enum WalkError {
+    #[error("get cwd: {0}")]
+    GetCwd(#[source] std::io::Error),
+    #[error("canonicalize project {}: {source}", path.display())]
+    Canonicalize {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("not a Unity project: {} (missing Assets/ or ProjectSettings/)", path.display())]
+    NotProject { path: PathBuf },
+    #[error("no Unity project root found above {}: needs `Assets/` + `ProjectSettings/`", cwd.display())]
+    NoProjectRoot { cwd: PathBuf },
+    #[error("Assets/ not found at {}", path.display())]
+    AssetsMissing { path: PathBuf },
+    #[error("walk error: {0}")]
+    Walk(#[from] ignore::Error),
+}
 
 /// Resolve a Unity project root: arg-given or climb up from CWD until we
 /// find a directory containing both `Assets/` and `ProjectSettings/`.
-pub fn resolve_project_root(arg: Option<&Path>) -> Result<PathBuf> {
+pub fn resolve_project_root(arg: Option<&Path>) -> Result<PathBuf, WalkError> {
     if let Some(p) = arg {
-        let p = p
-            .canonicalize()
-            .with_context(|| format!("canonicalize project: {}", p.display()))?;
+        let p = p.canonicalize().map_err(|source| WalkError::Canonicalize {
+            path: p.to_path_buf(),
+            source,
+        })?;
         ensure_project(&p)?;
         return Ok(p);
     }
-    let cwd = std::env::current_dir().context("get cwd")?;
+    let cwd = std::env::current_dir().map_err(WalkError::GetCwd)?;
     let mut cur: &Path = &cwd;
     loop {
         if is_project(cur) {
@@ -28,10 +49,7 @@ pub fn resolve_project_root(arg: Option<&Path>) -> Result<PathBuf> {
         }
         match cur.parent() {
             Some(p) => cur = p,
-            None => anyhow::bail!(
-                "no Unity project root found above {}: needs `Assets/` + `ProjectSettings/`",
-                cwd.display()
-            ),
+            None => return Err(WalkError::NoProjectRoot { cwd: cwd.clone() }),
         }
     }
 }
@@ -40,12 +58,11 @@ fn is_project(p: &Path) -> bool {
     p.join("Assets").is_dir() && p.join("ProjectSettings").is_dir()
 }
 
-fn ensure_project(p: &Path) -> Result<()> {
+fn ensure_project(p: &Path) -> Result<(), WalkError> {
     if !is_project(p) {
-        anyhow::bail!(
-            "not a Unity project: {} (missing Assets/ or ProjectSettings/)",
-            p.display()
-        );
+        return Err(WalkError::NotProject {
+            path: p.to_path_buf(),
+        });
     }
     Ok(())
 }
@@ -72,14 +89,14 @@ fn ensure_project(p: &Path) -> Result<()> {
 /// poisoned by another worker thread panic. Worker visitors aren't
 /// expected to panic in practice — the bake recovers panics into
 /// errors via `run_with_panic_safety`.
-pub fn walk_meta_files<F, V>(project_root: &Path, factory: F) -> Result<()>
+pub fn walk_meta_files<F, V>(project_root: &Path, factory: F) -> Result<(), WalkError>
 where
     F: Fn() -> V + Sync,
     V: FnMut(&Path) + Send + 'static,
 {
     let assets = project_root.join("Assets");
     if !assets.is_dir() {
-        anyhow::bail!("Assets/ not found at {}", assets.display());
+        return Err(WalkError::AssetsMissing { path: assets });
     }
     let packages = project_root.join("Packages");
 
@@ -89,17 +106,19 @@ where
     }
     // standard_filters(false): gitignore parsing in a Unity project is a
     // net loss — Library/ + Temp/ + build artifacts live outside Assets/
-    // and Packages/, so nothing under our roots would match. Skipping the
-    // gitignore-loading cost cuts warm walk by ~25 ms on meow-tower
-    // (18k entries). is_unity_hidden covers `.foo` and `foo~` hides per
-    // Unity's special-folder rule.
+    // and Packages/. Inside-Assets `.gitignore` files exist (Zenject
+    // codegen, scratch dirs, SmartLibrary `.asset` exclusions) but Unity
+    // doesn't honor them either — gitignored .meta files still carry
+    // guids that prefabs can reference, so the asset DB must include
+    // them. See [Walker ignore behavior](docs/asset-database.md#populating).
+    // `is_unity_hidden` covers `.foo` and `foo~` per Unity's special-folder rule.
     let walker = builder
         .standard_filters(false)
         .follow_links(false)
         .filter_entry(|e| !is_unity_hidden(e.file_name()))
         .build_parallel();
 
-    let err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let err: Arc<Mutex<Option<WalkError>>> = Arc::new(Mutex::new(None));
 
     walker.run(|| {
         let mut visit = factory();
@@ -109,7 +128,7 @@ where
             let entry = match res {
                 Ok(e) => e,
                 Err(e) => {
-                    *err.lock().unwrap() = Some(anyhow::anyhow!("walk error: {e}"));
+                    *err.lock().unwrap() = Some(WalkError::Walk(e));
                     return WalkState::Quit;
                 }
             };

@@ -36,5 +36,9 @@ for baseline numbers and per-phase semantics.
 ## Status
 
 - **API stability:** pre-1.0; signatures may shift.
-- **Errors:** internal `anyhow::Result` everywhere. Public API will move to
-  `thiserror` types before 1.0.
+- **Errors:** public API returns typed `thiserror` errors —
+  `StoreError`, `MetaParseError`, `WalkError`, `BakeError`. `BakeError`
+  exposes `Store(StoreError)` / `Walk(WalkError)` variants for matching
+  + `Other(anyhow::Error)` for the orchestrator's chained context.
+  Internal helpers in `bake.rs` still use `anyhow::Result` for ergonomic
+  context chaining; the typed boundary is `pub fn bake`.

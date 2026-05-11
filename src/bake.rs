@@ -25,10 +25,28 @@ use crate::asset;
 use crate::class_id::{ClassId, class_from_ext};
 use crate::meta::{self, SPRITE_MODE_SINGLE, TEXTURE_TYPE_SPRITE};
 use crate::store::{
-    self, AssetDb, AssetEntry, AssetType, BakeCache, CachedAssetType, CachedEntry, SubAsset,
-    CACHE_FILENAME, DB_FILENAME,
+    self, AssetDb, AssetEntry, AssetType, BakeCache, CachedAssetType, CachedEntry, StoreError,
+    SubAsset, CACHE_FILENAME, DB_FILENAME,
 };
-use crate::walk::walk_meta_files;
+use crate::walk::{walk_meta_files, WalkError};
+
+/// Errors from a bake run.
+///
+/// `Store(StoreError)` and `Walk(WalkError)` surface the typed source
+/// errors from those modules — match on them when you need to
+/// distinguish (e.g. "is this a schema-mismatch that needs re-bake?").
+/// `Other` carries the remaining anyhow-chained errors (cache I/O,
+/// dedup hard-fails, duplicate-guid checks) — most consumers propagate
+/// these untouched.
+#[derive(Debug, thiserror::Error)]
+pub enum BakeError {
+    #[error("{0}")]
+    Store(#[from] StoreError),
+    #[error("{0}")]
+    Walk(#[from] WalkError),
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
 
 /// Caller-supplied name sanitizer. Returns `Some(rewritten)` when the
 /// input contains characters the consumer wants to scrub from asset
@@ -275,7 +293,22 @@ pub struct BakeOptions {
 
 /// Bake entry-point. Walks `Assets/`, parses `.meta` + asset YAML,
 /// writes `<out_dir>/asset-db.bin` and `<out_dir>/asset-db.cache.bin`.
-pub fn bake(opts: &BakeOptions) -> Result<()> {
+pub fn bake(opts: &BakeOptions) -> Result<(), BakeError> {
+    bake_inner(opts).map_err(|e| {
+        // Surface typed source errors when they bubbled up via `?`
+        // without context wrapping — consumers can match on
+        // `BakeError::Store` etc. Otherwise fall through to `Other`.
+        match e.downcast::<StoreError>() {
+            Ok(s) => return BakeError::Store(s),
+            Err(e) => match e.downcast::<WalkError>() {
+                Ok(w) => return BakeError::Walk(w),
+                Err(e) => BakeError::Other(e),
+            },
+        }
+    })
+}
+
+fn bake_inner(opts: &BakeOptions) -> Result<()> {
     let project_root = &opts.project_root;
     std::fs::create_dir_all(&opts.out_dir)
         .with_context(|| format!("create out-dir: {}", opts.out_dir.display()))?;

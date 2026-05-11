@@ -16,7 +16,6 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use bincode::{Decode, Encode};
 
 use crate::class_id::ClassId;
@@ -236,95 +235,147 @@ pub fn cache_path(dir: &Path) -> PathBuf {
     dir.join(CACHE_FILENAME)
 }
 
+// ─── Errors ──────────────────────────────────────────────────────────────
+
+/// Errors from reading/writing the on-disk asset-db / cache binaries.
+///
+/// Distinguishes filesystem errors (path-tagged), envelope-level
+/// validation (magic + schema), and the underlying `bincode` codec
+/// errors. Consumers can match on `SchemaMismatch` to detect "needs
+/// re-bake" without string-parsing.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("{op} {}: {source}", path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{label} too short ({len} bytes)")]
+    MagicTooShort { label: &'static str, len: usize },
+    #[error("{label} magic mismatch")]
+    MagicMismatch { label: &'static str },
+    #[error("{label} schema {found} expected {expected}, re-bake required")]
+    SchemaMismatch {
+        label: &'static str,
+        found: u16,
+        expected: u16,
+    },
+    #[error("bincode decode: {0}")]
+    BincodeDecode(#[from] bincode::error::DecodeError),
+    #[error("bincode encode: {0}")]
+    BincodeEncode(#[from] bincode::error::EncodeError),
+}
+
 // ─── IO ──────────────────────────────────────────────────────────────────
 
 /// Read the convert artifact.
-pub fn read(path: &Path) -> Result<AssetDb> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("read asset-db: {}", path.display()))?;
+pub fn read(path: &Path) -> Result<AssetDb, StoreError> {
+    let bytes = std::fs::read(path).map_err(|source| StoreError::Io {
+        op: "read asset-db",
+        path: path.to_path_buf(),
+        source,
+    })?;
     decode(&bytes)
 }
 
-pub fn decode(bytes: &[u8]) -> Result<AssetDb> {
+pub fn decode(bytes: &[u8]) -> Result<AssetDb, StoreError> {
     let body = check_magic(bytes, MAGIC, "asset-db")?;
     let cfg = bincode::config::standard();
-    let (db, _): (AssetDb, _) = bincode::decode_from_slice(body, cfg).context("bincode decode")?;
+    let (db, _): (AssetDb, _) = bincode::decode_from_slice(body, cfg)?;
     if db.schema_version != SCHEMA_VERSION {
-        anyhow::bail!(
-            "asset-db schema {} expected {}, re-bake required",
-            db.schema_version,
-            SCHEMA_VERSION
-        );
+        return Err(StoreError::SchemaMismatch {
+            label: "asset-db",
+            found: db.schema_version,
+            expected: SCHEMA_VERSION,
+        });
     }
     Ok(db)
 }
 
 /// Write the convert artifact, creating parent dirs as needed.
-pub fn write(path: &Path, db: &AssetDb) -> Result<()> {
+pub fn write(path: &Path, db: &AssetDb) -> Result<(), StoreError> {
     write_bytes(path, &encode(db)?)
 }
 
-pub fn encode(db: &AssetDb) -> Result<Vec<u8>> {
+pub fn encode(db: &AssetDb) -> Result<Vec<u8>, StoreError> {
     encode_with_magic(db, MAGIC)
 }
 
-/// Read the bake-only cache. Returns `BakeCache::new()` (empty, current
-/// schema) if the file is missing or unreadable — first bake or stale
-/// cache, parse everything from scratch.
-pub fn read_cache(path: &Path) -> Result<BakeCache> {
-    let bytes = std::fs::read(path).with_context(|| format!("read cache: {}", path.display()))?;
+/// Read the bake-only cache. Caller decides what to do on error —
+/// the bake treats any error here as "no cache, parse from scratch".
+pub fn read_cache(path: &Path) -> Result<BakeCache, StoreError> {
+    let bytes = std::fs::read(path).map_err(|source| StoreError::Io {
+        op: "read cache",
+        path: path.to_path_buf(),
+        source,
+    })?;
     decode_cache(&bytes)
 }
 
-pub fn decode_cache(bytes: &[u8]) -> Result<BakeCache> {
+pub fn decode_cache(bytes: &[u8]) -> Result<BakeCache, StoreError> {
     let body = check_magic(bytes, CACHE_MAGIC, "asset-db.cache")?;
     let cfg = bincode::config::standard();
-    let (cache, _): (BakeCache, _) =
-        bincode::decode_from_slice(body, cfg).context("bincode decode cache")?;
+    let (cache, _): (BakeCache, _) = bincode::decode_from_slice(body, cfg)?;
     if cache.schema_version != SCHEMA_VERSION {
-        anyhow::bail!(
-            "asset-db cache schema {} expected {}",
-            cache.schema_version,
-            SCHEMA_VERSION
-        );
+        return Err(StoreError::SchemaMismatch {
+            label: "asset-db.cache",
+            found: cache.schema_version,
+            expected: SCHEMA_VERSION,
+        });
     }
     Ok(cache)
 }
 
-pub fn write_cache(path: &Path, cache: &BakeCache) -> Result<()> {
+pub fn write_cache(path: &Path, cache: &BakeCache) -> Result<(), StoreError> {
     write_bytes(path, &encode_cache(cache)?)
 }
 
-pub fn encode_cache(cache: &BakeCache) -> Result<Vec<u8>> {
+pub fn encode_cache(cache: &BakeCache) -> Result<Vec<u8>, StoreError> {
     encode_with_magic(cache, CACHE_MAGIC)
 }
 
-fn encode_with_magic<T: Encode>(value: &T, magic: [u8; 8]) -> Result<Vec<u8>> {
+fn encode_with_magic<T: Encode>(value: &T, magic: [u8; 8]) -> Result<Vec<u8>, StoreError> {
     let cfg = bincode::config::standard();
-    let body = bincode::encode_to_vec(value, cfg).context("bincode encode")?;
+    let body = bincode::encode_to_vec(value, cfg)?;
     let mut out = Vec::with_capacity(magic.len() + body.len());
     out.extend_from_slice(&magic);
     out.extend_from_slice(&body);
     Ok(out)
 }
 
-fn check_magic<'a>(bytes: &'a [u8], magic: [u8; 8], label: &str) -> Result<&'a [u8]> {
+fn check_magic<'a>(
+    bytes: &'a [u8],
+    magic: [u8; 8],
+    label: &'static str,
+) -> Result<&'a [u8], StoreError> {
     if bytes.len() < magic.len() {
-        anyhow::bail!("{label} too short ({} bytes)", bytes.len());
+        return Err(StoreError::MagicTooShort {
+            label,
+            len: bytes.len(),
+        });
     }
     let (head, body) = bytes.split_at(magic.len());
     if head != magic {
-        anyhow::bail!("{label} magic mismatch");
+        return Err(StoreError::MagicMismatch { label });
     }
     Ok(body)
 }
 
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create dir: {}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+            op: "create dir",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
-    std::fs::write(path, bytes).with_context(|| format!("write: {}", path.display()))?;
+    std::fs::write(path, bytes).map_err(|source| StoreError::Io {
+        op: "write",
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
