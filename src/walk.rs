@@ -87,8 +87,14 @@ where
     if packages.is_dir() {
         builder.add(&packages);
     }
+    // standard_filters(false): gitignore parsing in a Unity project is a
+    // net loss — Library/ + Temp/ + build artifacts live outside Assets/
+    // and Packages/, so nothing under our roots would match. Skipping the
+    // gitignore-loading cost cuts warm walk by ~25 ms on meow-tower
+    // (18k entries). is_unity_hidden covers `.foo` and `foo~` hides per
+    // Unity's special-folder rule.
     let walker = builder
-        .standard_filters(true) // gitignore + hidden + global
+        .standard_filters(false)
         .follow_links(false)
         .filter_entry(|e| !is_unity_hidden(e.file_name()))
         .build_parallel();
