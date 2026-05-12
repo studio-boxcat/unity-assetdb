@@ -19,7 +19,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use unity_assetdb::bake::{BakeOptions, bake};
-use unity_assetdb::query::{self, AssetTypeFilter, format_guid, parse_guid};
+use unity_assetdb::query::{self, AssetTypeFilter, parse_guid};
 use unity_assetdb::register::{ImporterKind, RegisterOptions, register};
 use unity_assetdb::store::{AssetDb, AssetEntry};
 use unity_assetdb::suggest::suggest;
@@ -236,7 +236,8 @@ fn run_guid(common: CommonOpts, out: OutputOpts, path: &str) -> anyhow::Result<E
         if out.json {
             write_row(&mut w, entry, &db, true)?;
         } else {
-            writeln!(w, "{:032x}", entry.guid)?;
+            w.write_all(&u128_hex(entry.guid))?;
+            w.write_all(b"\n")?;
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -260,7 +261,8 @@ fn run_path(common: CommonOpts, out: OutputOpts, guid_str: &str) -> anyhow::Resu
         return Ok(ExitCode::SUCCESS);
     }
     // No fuzzy on raw hex — distance over hex strings isn't useful.
-    eprintln!("guid not found: {:032x}", guid);
+    let hex = u128_hex(guid);
+    eprintln!("guid not found: {}", std::str::from_utf8(&hex).unwrap());
     Ok(ExitCode::from(1))
 }
 
@@ -268,8 +270,10 @@ fn run_find(common: CommonOpts, out: OutputOpts, pattern: &str) -> anyhow::Resul
     let out_dir = resolve_out_dir(&common)?;
     let db = query::open(&out_dir)?;
     let hits = query::find(&db, pattern);
+    // Bulk emit — `Stdout` is unbuffered when piped, so without
+    // `BufWriter` 18 k `writeln!` calls would be 18 k write syscalls.
     let stdout = std::io::stdout();
-    let mut w = stdout.lock();
+    let mut w = std::io::BufWriter::new(stdout.lock());
     for e in hits {
         write_row(&mut w, e, &db, out.json)?;
     }
@@ -288,7 +292,7 @@ fn run_list(
         None => None,
     };
     let stdout = std::io::stdout();
-    let mut w = stdout.lock();
+    let mut w = std::io::BufWriter::new(stdout.lock());
     for e in query::list(&db, filter) {
         write_row(&mut w, e, &db, out.json)?;
     }
@@ -309,7 +313,7 @@ fn run_alias(
         return Ok(ExitCode::from(1));
     }
     let stdout = std::io::stdout();
-    let mut w = stdout.lock();
+    let mut w = std::io::BufWriter::new(stdout.lock());
     for e in hits {
         write_row(&mut w, e, &db, out.json)?;
     }
@@ -347,7 +351,10 @@ fn run_register(
     if !outcome.created_meta {
         eprintln!("note: meta already exists; printing existing guid");
     }
-    println!("{}", format_guid(outcome.guid));
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    w.write_all(&u128_hex(outcome.guid))?;
+    w.write_all(b"\n")?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -374,36 +381,50 @@ fn resolve_out_dir(common: &CommonOpts) -> anyhow::Result<PathBuf> {
     Ok(project_root.join("Library").join("unity-assetdb"))
 }
 
-/// Write one entry to `w` in TSV or JSON. Inlines the GUID and type
-/// formatting so a `list` over a 50k-entry db doesn't pay 100k+
-/// `String` allocations.
+/// Write one entry to `w` in TSV or JSON. Uses [`u128_hex`] instead of
+/// `std::fmt`'s `{:032x}` for the GUID columns — measured ~17% faster
+/// per row on 18 k-entry emit by skipping the formatter trait dispatch.
 fn write_row(
     w: &mut impl Write,
     entry: &AssetEntry,
     db: &AssetDb,
     json: bool,
 ) -> std::io::Result<()> {
+    let guid_hex = u128_hex(entry.guid);
     if json {
-        write!(
-            w,
-            "{{\"guid\":\"{:032x}\",\"name\":\"",
-            entry.guid
-        )?;
+        w.write_all(b"{\"guid\":\"")?;
+        w.write_all(&guid_hex)?;
+        w.write_all(b"\",\"name\":\"")?;
         write_json_escaped(w, &entry.name)?;
-        write!(w, "\",\"type\":\"")?;
+        w.write_all(b"\",\"type\":\"")?;
         write_asset_type(w, entry.asset_type, db, |w, s| write_json_escaped(w, s))?;
-        write!(w, "\",\"hint\":\"")?;
+        w.write_all(b"\",\"hint\":\"")?;
         write_json_escaped(w, &entry.hint)?;
-        writeln!(w, "\"}}")
+        w.write_all(b"\"}\n")
     } else {
-        write!(w, "{:032x}\t", entry.guid)?;
+        w.write_all(&guid_hex)?;
+        w.write_all(b"\t")?;
         write_tsv_escaped(w, &entry.name)?;
         w.write_all(b"\t")?;
         write_asset_type(w, entry.asset_type, db, |w, s| w.write_all(s.as_bytes()))?;
         w.write_all(b"\t")?;
         write_tsv_escaped(w, &entry.hint)?;
-        writeln!(w)
+        w.write_all(b"\n")
     }
+}
+
+/// Format a `u128` as 32 lowercase hex bytes. Bypasses `std::fmt::write`
+/// — the formatter trait dispatch is ~17% of the per-row write cost on
+/// `list` emit (bench in `examples/bench_list.rs`).
+pub(crate) fn u128_hex(v: u128) -> [u8; 32] {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let bytes = v.to_be_bytes();
+    let mut out = [0u8; 32];
+    for (i, b) in bytes.iter().enumerate() {
+        out[i * 2] = LUT[(b >> 4) as usize];
+        out[i * 2 + 1] = LUT[(b & 0xf) as usize];
+    }
+    out
 }
 
 fn write_asset_type<W: Write>(
@@ -419,7 +440,10 @@ fn write_asset_type<W: Write>(
             Some(c) => escape(w, c.name()),
             None => write!(w, "Native:{n}"),
         },
-        AssetType::Script(idx) => write!(w, "Script:{:032x}", db.script_guid(idx)),
+        AssetType::Script(idx) => {
+            w.write_all(b"Script:")?;
+            w.write_all(&u128_hex(db.script_guid(idx)))
+        }
     }
 }
 

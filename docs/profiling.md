@@ -78,29 +78,55 @@ cold:  walked=20560 hit=0 parsed=18169
 
 ### Query + register subcommands
 
-Captured 2026-05-12, same hardware. Hyperfine 10-run means, `--warmup 2`,
-release binary, stdout redirected to `/dev/null`. Against the warm bake
-above (18,169-entry `asset-db.bin`).
+Captured 2026-05-12, same hardware. Hyperfine 15-run means, `--warmup 3`,
+release binary, stdout to `/dev/null`. Against the warm bake above
+(18,169-entry `asset-db.bin`).
 
 | Subcommand | Mean | σ | What it does |
 |---|---:|---:|---|
-| `path <guid>` | 4.6 ms | 0.2 | bin load + binary-search by guid |
-| `alias <name>` (hit) | 4.5 ms | 0.2 | bin load + linear scan on name |
-| `guid <path>` (hit) | 4.8 ms | 0.2 | bin load + linear scan on hint |
-| `alias <name>` (miss + fuzzy) | 6.5 ms | 0.5 | bin load + ASCII Levenshtein over names |
-| `find <pattern>` | 6.2 ms | 0.3 | bin load + ASCII case-insensitive substring scan |
-| `list --type Sprite` | 10.4 ms | 0.5 | bin load + filter + emit 1,041 rows |
-| `list` (full emit) | 16.8 ms | 0.4 | bin load + emit all 18,169 rows |
-| `register` (idempotent) | 6.8 ms | 0.4 | bin load + parse existing meta + diff |
+| `path <guid>` | 5.2 ms | 0.2 | bin load + binary-search by guid |
+| `alias <name>` (hit) | 5.8 ms | 0.5 | bin load + linear scan on name |
+| `guid <path>` (hit) | 5.3 ms | 0.3 | bin load + linear scan on hint |
+| `find <pattern>` | 6.5 ms | 0.4 | bin load + ASCII case-insensitive substring scan |
+| `list --type Sprite` | 7.8 ms | 0.7 | bin load + filter + emit 1,041 rows (BufWriter) |
+| `list` (full emit) | 7.9 ms | 0.4 | bin load + emit all 18,169 rows (BufWriter + u128_hex) |
+| `register` (idempotent) | 7–12 ms | (variable) | bin load + parse existing meta + diff |
 | `register` (fresh asset) | 10.9 ms | 1.1 | bin load + synthesize meta + insert row + atomic write |
 
-Point lookups (`path`/`alias`/`guid`) are bin-load-bound (~4.5 ms is
-`bincode::decode_from_slice` over 2.1 MB). `list` full-emit at 16.8 ms is
-dominated by 18 k `writeln!` calls; `find` and fuzzy-`alias` ride the
-ASCII byte-path optimizations in `query::find` and `suggest::ascii_*`
-(skip `to_lowercase` allocations on the hot loop). `register` fresh
-adds ~4 ms over idempotent for `getrandom` + `OpenOptions::create_new`
-meta write + bin/cache rewrite under the advisory flock.
+### Where the time actually goes
+
+Microbenched via `examples/bench_list.rs` (run with
+`cargo build --release --example bench_list && target/release/examples/bench_list`):
+
+| Phase | Cost / iter | Notes |
+|---|---:|---|
+| `fs::read` (2.1 MB) | 0.07 ms | OS page cache after warmup |
+| `store::decode` (bincode in-memory) | 1.79 ms | **Floor every query pays.** |
+| iter all entries (no IO) | 0.01 ms | guid-sorted Vec; trivial |
+| `write_row` × 18 k → sink | 2.04 ms | `std::fmt` for `{:032x}` + write_tsv_escaped |
+| Same but with `u128_hex` | 1.70 ms | −17% per row; LUT bypass of `fmt::Write` dispatch |
+| Raw write_all bytes × 18 k | 0.20 ms | floor for the emit loop (no formatting) |
+
+Total CPU for a full `list`: 1.79 ms (decode) + 1.70 ms (formatting) +
+~0.2 ms (byte writes) ≈ 3.7 ms. Real-world hyperfine reports 7.9 ms,
+so ~4 ms is process startup (libstd, clap, binary load) — fixed cost.
+
+### Optimization history (query path)
+
+| Change | `list` full | Notes |
+|--------|------------:|-------|
+| Baseline (pre-`BufWriter`) | 16.8 ms | Each `writeln!` was its own syscall when piped |
+| `BufWriter::new(stdout.lock())` | ~10 ms | Batch into 8 KB chunks; ~200 syscalls instead of 18 k |
+| `u128_hex` LUT instead of `{:032x}` | 7.9 ms | Skip `std::fmt::write` trait dispatch for the GUID columns |
+
+### Probed and rejected
+
+- **bincode `with_fixed_int_encoding()`**: ~5% decode speedup (1.79 → 1.67 ms)
+  at +24% file size (2.20 → 2.72 MB). Schema bump for marginal gain. Skipped.
+- **Memory-map + offset index** to skip full decode for point lookups: ~1.8 ms
+  potential saving on `path`/`guid`/`alias`, requires a new on-disk format
+  with a sorted (guid, offset) table appended to the bin. ~150 LOC of
+  schema work for a saving the user can't perceive at this scale.
 
 ### Optimization history
 
