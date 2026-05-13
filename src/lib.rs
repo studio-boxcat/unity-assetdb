@@ -15,6 +15,7 @@
 //! - [`query`] — read-only lookups against a baked `asset-db.bin`.
 //! - [`register`] — synthesize a `.meta` outside Unity, incremental db insert.
 //! - [`suggest`] — fuzzy "did you mean" helper used by the query CLI.
+//! - [`usage`] — scan project files for references to a given GUID.
 
 pub mod asset;
 pub mod bake;
@@ -24,4 +25,5 @@ pub mod query;
 pub mod register;
 pub mod store;
 pub mod suggest;
+pub mod usage;
 pub mod walk;

@@ -92,6 +92,18 @@ release binary, stdout to `/dev/null`. Against the warm bake above
 | `list` (full emit) | 7.9 ms | 0.4 | bin load + emit all 18,169 rows (BufWriter + u128_hex) |
 | `register` (idempotent) | 7–12 ms | (variable) | bin load + parse existing meta + diff |
 | `register` (fresh asset) | 10.9 ms | 1.1 | bin load + synthesize meta + insert row + atomic write |
+| `guid <pattern>` (substring, hit) | 6.6 ms | 0.3 | bin load + exact scan (miss) + ASCII substring scan on `hint` |
+| `guid <pattern>` (substring, miss) | 7.5 ms | 0.3 | +suggest pool scan over hints |
+| `usage <guid>` (heavy, 121 hits) | 510 ms | 45 | parallel walk over 30,955 YAML files (58 MB total) + memmem |
+| `usage <guid>` (light, 3 hits) | 558 ms | 39 | same walk; hit count is in the noise |
+
+Last four rows recaptured 2026-05-13 against an 18,197-entry bake of the
+same project (+28 entries since the original 2026-05-12 capture).
+
+`usage`'s cost is dominated by the walk, not the per-file scan. For
+context, `rg <hex>` over the same file set (`--no-ignore -t unity` with
+the same extension list) measures 494 ms ± 47 ms on this hardware —
+i.e. `usage` is at the I/O-bound floor.
 
 ### Where the time actually goes
 

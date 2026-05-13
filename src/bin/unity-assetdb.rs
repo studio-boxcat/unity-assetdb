@@ -2,8 +2,12 @@
 //!
 //! Subcommands:
 //! - `bake` — walk the project, write the `asset-db.bin` index.
-//! - `guid <path>` / `path <guid>` / `find <pattern>` / `list [--type <kind>]`
-//!   / `alias <name>` — read-only queries against a baked index.
+//! - `guid <path|pattern>` / `path <guid>` / `find <pattern>` /
+//!   `list [--type <kind>]` / `alias <name>` — read-only queries against
+//!   a baked index. `guid` falls back to a case-insensitive substring
+//!   match on hints when the arg isn't an exact path.
+//! - `usage <guid|path>` — scan project YAML assets for references to
+//!   the given GUID (resolves a path-arg via the baked index first).
 //! - `register <path> [--type <importer>]` — synthesize a `.meta` and
 //!   incrementally update the bin.
 //!
@@ -23,6 +27,7 @@ use unity_assetdb::query::{self, AssetTypeFilter, parse_guid};
 use unity_assetdb::register::{ImporterKind, RegisterOptions, register};
 use unity_assetdb::store::{AssetDb, AssetEntry};
 use unity_assetdb::suggest::suggest;
+use unity_assetdb::usage::{self, UsageMatch};
 use unity_assetdb::walk::resolve_project_root;
 
 #[derive(Parser)]
@@ -48,7 +53,10 @@ enum Commands {
         #[arg(long, value_name = "CHARS")]
         scrub_chars: Option<String>,
     },
-    /// Project-relative path → GUID hex.
+    /// Project-relative path → entry row. Exact-hint match returns the
+    /// single row; otherwise falls back to a case-insensitive substring
+    /// match on hints and lists every hit. Same row format as
+    /// `find` / `list`.
     Guid {
         #[command(flatten)]
         common: CommonOpts,
@@ -96,6 +104,17 @@ enum Commands {
         #[arg(long, value_name = "CHARS")]
         scrub_chars: Option<String>,
         name: String,
+    },
+    /// Scan project YAML assets for references to a GUID. Arg accepts
+    /// either a 32-hex GUID or a project-rel path (resolved via the
+    /// baked index). Empty output when nothing references it.
+    Usage {
+        #[command(flatten)]
+        common: CommonOpts,
+        #[command(flatten)]
+        out: OutputOpts,
+        /// 32-hex GUID (hyphens tolerated) or project-rel path.
+        target: String,
     },
     /// Synthesize a minimal `.meta` for an asset Unity hasn't imported
     /// yet, incrementally update `asset-db.bin`, print the GUID.
@@ -176,6 +195,7 @@ fn run(cmd: Commands) -> anyhow::Result<ExitCode> {
             scrub_chars,
             name,
         } => run_alias(common, out, scrub_chars.as_deref(), &name),
+        Commands::Usage { common, out, target } => run_usage(common, out, &target),
         Commands::Register {
             common,
             r#type,
@@ -230,20 +250,23 @@ fn scrub_chars_in(name: &str, scrub: &[char]) -> Option<String> {
 fn run_guid(common: CommonOpts, out: OutputOpts, path: &str) -> anyhow::Result<ExitCode> {
     let out_dir = resolve_out_dir(&common)?;
     let db = query::open(&out_dir)?;
-    if let Some(entry) = query::guid_of_path(&db, path) {
-        let stdout = std::io::stdout();
-        let mut w = stdout.lock();
-        if out.json {
-            write_row(&mut w, entry, &db, true)?;
-        } else {
-            w.write_all(&u128_hex(entry.guid))?;
-            w.write_all(b"\n")?;
-        }
-        return Ok(ExitCode::SUCCESS);
+    // Exact hint hit → single row. Otherwise treat the arg as a
+    // case-insensitive substring pattern on hints and list every match.
+    let hits: Vec<&AssetEntry> = match query::guid_of_path(&db, path) {
+        Some(entry) => vec![entry],
+        None => query::find_by_hint(&db, path),
+    };
+    if hits.is_empty() {
+        let needle = query::normalize_hint(path);
+        print_miss("path", &needle, db.entries.iter().map(|e| e.hint.as_ref()));
+        return Ok(ExitCode::from(1));
     }
-    let needle = query::normalize_hint(path);
-    print_miss("path", &needle, db.entries.iter().map(|e| e.hint.as_ref()));
-    Ok(ExitCode::from(1))
+    let stdout = std::io::stdout();
+    let mut w = std::io::BufWriter::new(stdout.lock());
+    for e in hits {
+        write_row(&mut w, e, &db, out.json)?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_path(common: CommonOpts, out: OutputOpts, guid_str: &str) -> anyhow::Result<ExitCode> {
@@ -318,6 +341,50 @@ fn run_alias(
         write_row(&mut w, e, &db, out.json)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ─── usage ───────────────────────────────────────────────────────────────
+
+/// Resolve `target` to a GUID: 32-hex (hyphens tolerated) is taken as-is;
+/// anything else is looked up as a project-rel path against the baked
+/// index. Then walks the project for references to that GUID.
+fn run_usage(common: CommonOpts, out: OutputOpts, target: &str) -> anyhow::Result<ExitCode> {
+    let (project_root, out_dir) = resolve_paths(&common)?;
+    let guid = if let Ok(g) = parse_guid(target) {
+        g
+    } else {
+        let db = query::open(&out_dir)?;
+        let Some(entry) = query::guid_of_path(&db, target) else {
+            let needle = query::normalize_hint(target);
+            print_miss("path", &needle, db.entries.iter().map(|e| e.hint.as_ref()));
+            return Ok(ExitCode::from(1));
+        };
+        entry.guid
+    };
+    let hex = u128_hex(guid);
+    let hits = usage::find_usages(&project_root, &hex)?;
+    let stdout = std::io::stdout();
+    let mut w = std::io::BufWriter::new(stdout.lock());
+    for h in &hits {
+        write_usage_row(&mut w, h, out.json)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_usage_row(w: &mut impl Write, m: &UsageMatch, json: bool) -> std::io::Result<()> {
+    let path = m.path.to_string_lossy();
+    if json {
+        w.write_all(b"{\"path\":\"")?;
+        write_json_escaped(w, &path)?;
+        write!(w, "\",\"line\":{},\"text\":\"", m.line)?;
+        write_json_escaped(w, &m.text)?;
+        w.write_all(b"\"}\n")
+    } else {
+        write_tsv_escaped(w, &path)?;
+        write!(w, "\t{}\t", m.line)?;
+        write_tsv_escaped(w, &m.text)?;
+        w.write_all(b"\n")
+    }
 }
 
 // ─── register ────────────────────────────────────────────────────────────

@@ -22,10 +22,13 @@ asset-catalog baker for the Unity client.
 - `walk` — project-root resolver + parallel `Assets/` walker.
 - `bake` — orchestrator (`BakeOptions`, `bake`, `parse_one`).
 - `query` — read-only lookups against a baked `asset-db.bin` (`guid_of_path`,
-  `path_of_guid`, `find`, `list`, `alias`).
+  `path_of_guid`, `find`, `find_by_hint`, `list`, `alias`).
 - `register` — synthesize a minimal `.meta` outside Unity, incremental
   db insert. Advisory-flocked against concurrent bakes.
 - `suggest` — fuzzy "did you mean" helper used by the query CLI on miss.
+- `usage` — scan project YAML for files referencing a given GUID
+  (`find_usages`, `UsageMatch`). Native substitute for `rg <hex>` that
+  knows which extensions are Unity YAML.
 
 ## CLI
 
@@ -35,13 +38,16 @@ just install                                   # cargo install --path . → ~/.c
 # Bake the index.
 unity-assetdb bake [--project <path>] [--out-dir <path>] [--scrub-chars <chars>]
 
-# Queries (TSV by default, --json opt-in). Exit 1 on point-lookup miss
-# (guid/path/alias), exit 0 otherwise. find/list never miss (empty = empty).
-unity-assetdb guid  <project-rel-path>         # → 32-hex GUID
+# Queries (TSV by default, --json opt-in). Exit 1 when nothing matches
+# (guid/path/alias, or `usage <path>` with an unresolved path); exit 0
+# otherwise. `find` / `list` and `usage`'s file scan never miss
+# (empty output = empty result).
+unity-assetdb guid  <path|pattern>             # exact hint → 1 row; else substring on hints
 unity-assetdb path  <guid>                     # → project-rel hint
 unity-assetdb find  <pattern>                  # case-insensitive substring on names
 unity-assetdb list  [--type <kind>]            # all entries, optional ClassId or Script:<32hex>
 unity-assetdb alias <name> [--scrub-chars <c>] # exact-match (auto-scrubs input)
+unity-assetdb usage <guid|path>                # path\tline\ttext for every YAML file referencing the GUID
 
 # Register a new asset without booting Unity. Synthesizes a minimal .meta
 # with a fresh 128-bit GUID; Unity refills the importer block on next focus

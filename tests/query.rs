@@ -115,6 +115,31 @@ fn guid_of_path_miss() {
 }
 
 #[test]
+fn find_by_hint_substring_matches_case_insensitively() {
+    let root = unique_tmp("find-by-hint");
+    let _ = fs::remove_dir_all(&root);
+    make_basic_project(&root);
+    let out_dir = bake_at(&root);
+    let db = query::open(&out_dir).unwrap();
+
+    // Lowercase, partial path: matches Foo.prefab via 'ui/foo'.
+    let hits = query::find_by_hint(&db, "ui/foo");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(&*hits[0].hint, "Assets/UI/Foo.prefab");
+
+    // 'Bar' substring matches both Bar/Inner.png and SO/Bar.asset.
+    let mut hints: Vec<&str> = query::find_by_hint(&db, "Bar")
+        .into_iter()
+        .map(|e| e.hint.as_ref())
+        .collect();
+    hints.sort();
+    assert_eq!(hints, vec!["Assets/Bar/Inner.png", "Assets/SO/Bar.asset"]);
+
+    // Miss returns empty (never errors).
+    assert!(query::find_by_hint(&db, "no-such-thing").is_empty());
+}
+
+#[test]
 fn path_of_guid_hits_existing_entry() {
     let root = unique_tmp("path-hit");
     let _ = fs::remove_dir_all(&root);

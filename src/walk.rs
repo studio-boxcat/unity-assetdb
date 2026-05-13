@@ -152,9 +152,10 @@ where
     Ok(())
 }
 
-fn is_unity_hidden(name: &std::ffi::OsStr) -> bool {
-    // Byte-level check — non-UTF-8 filenames (rare but possible on Unix)
-    // would silently slip through a `to_str()`-based check.
+/// Unity-hidden file-name predicate: `.foo` or `foo~` per Unity's
+/// special-folder rule. Byte-level — non-UTF-8 filenames (rare but
+/// possible on Unix) would silently slip through a `to_str()` check.
+pub(crate) fn is_unity_hidden(name: &std::ffi::OsStr) -> bool {
     let bytes = name.as_encoded_bytes();
     bytes.first() == Some(&b'.') || bytes.last() == Some(&b'~')
 }

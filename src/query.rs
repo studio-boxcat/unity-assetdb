@@ -1,10 +1,13 @@
 //! Read-only queries against a baked `asset-db.bin`.
 //!
-//! Five operations exposed via the CLI (`unity-assetdb guid|path|find|list|alias`)
-//! and as a library API:
+//! Library operations (the first five are 1:1 with the CLI
+//! `unity-assetdb guid|path|find|list|alias`; [`find_by_hint`] is a helper
+//! the `guid` CLI calls on substring fallback):
 //! - [`guid_of_path`] — project-relative path → top-level entry.
 //! - [`path_of_guid`] — GUID → top-level entry.
 //! - [`find`] — case-insensitive substring match on `name`. Returns all hits.
+//! - [`find_by_hint`] — case-insensitive substring match on `hint`
+//!   (project-rel path). Powers the `guid` CLI fallback.
 //! - [`list`] — full or type-filtered iterator.
 //! - [`alias`] — exact-match name lookup. Optional `scrub_chars` applies the
 //!   bake's scrub policy to the input before compare.
@@ -65,17 +68,32 @@ pub fn path_of_guid(db: &AssetDb, guid: u128) -> Option<&AssetEntry> {
 /// effectively always ASCII; if the needle has non-ASCII chars we fall
 /// back to the Unicode `to_lowercase` path.
 pub fn find<'a>(db: &'a AssetDb, pattern: &str) -> Vec<&'a AssetEntry> {
+    find_by(db, pattern, |e| &e.name)
+}
+
+/// Case-insensitive substring match on each entry's `hint` (project-rel
+/// path). Used by the `guid <pattern>` fallback when an exact path miss
+/// turns the arg into a substring query.
+pub fn find_by_hint<'a>(db: &'a AssetDb, pattern: &str) -> Vec<&'a AssetEntry> {
+    let normalized = normalize_hint(pattern);
+    find_by(db, &normalized, |e| &e.hint)
+}
+
+fn find_by<'a, F>(db: &'a AssetDb, pattern: &str, field: F) -> Vec<&'a AssetEntry>
+where
+    F: Fn(&'a AssetEntry) -> &'a str,
+{
     if pattern.is_ascii() {
         let needle = pattern.as_bytes();
         db.entries
             .iter()
-            .filter(|e| ascii_icase_contains(e.name.as_bytes(), needle))
+            .filter(|e| ascii_icase_contains(field(e).as_bytes(), needle))
             .collect()
     } else {
         let needle = pattern.to_lowercase();
         db.entries
             .iter()
-            .filter(|e| e.name.to_lowercase().contains(&needle))
+            .filter(|e| field(e).to_lowercase().contains(&needle))
             .collect()
     }
 }
