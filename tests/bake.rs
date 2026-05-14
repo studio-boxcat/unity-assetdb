@@ -902,6 +902,122 @@ fn bake_creates_missing_meta_files() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// Pin: `.androidlib` / `.androidpack` / `.aar` folders are folder-based
+/// Android plugins. Unity authors a `.meta` for the folder itself but
+/// hands the contents off to Gradle untouched — no per-file metas.
+/// The bake's missing-meta pre-pass must mirror that: synthesize the
+/// folder meta if absent, but never descend into the folder.
+#[test]
+fn bake_does_not_synthesize_inside_opaque_android_plugin_folders() {
+    let root = unique_tmp("opaque-android-plugins");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+
+    // Three folder-based Android plugin shapes Unity treats as opaque.
+    write(
+        &root.join("Assets/Plugins/Android/FirebaseApp.androidlib/AndroidManifest.xml"),
+        "<manifest/>\n",
+    );
+    write(
+        &root.join("Assets/Plugins/Android/FirebaseApp.androidlib/res/values/strings.xml"),
+        "<resources/>\n",
+    );
+    write(
+        &root.join("Assets/Plugins/Android/Pack.androidpack/gradle.properties"),
+        "x=1\n",
+    );
+    write(
+        &root.join("Assets/Plugins/Android/Lib.aar/classes.dex"),
+        "fake-dex\n",
+    );
+
+    bake_at(&root);
+
+    // Folder metas synthesized for the opaque roots themselves.
+    for folder_meta in [
+        "Assets/Plugins/Android/FirebaseApp.androidlib.meta",
+        "Assets/Plugins/Android/Pack.androidpack.meta",
+        "Assets/Plugins/Android/Lib.aar.meta",
+    ] {
+        assert!(
+            root.join(folder_meta).exists(),
+            "expected folder meta {folder_meta} to be synthesized",
+        );
+    }
+
+    // Nothing synthesized inside the opaque folders.
+    for skipped in [
+        "Assets/Plugins/Android/FirebaseApp.androidlib/AndroidManifest.xml.meta",
+        "Assets/Plugins/Android/FirebaseApp.androidlib/res.meta",
+        "Assets/Plugins/Android/FirebaseApp.androidlib/res/values.meta",
+        "Assets/Plugins/Android/FirebaseApp.androidlib/res/values/strings.xml.meta",
+        "Assets/Plugins/Android/Pack.androidpack/gradle.properties.meta",
+        "Assets/Plugins/Android/Lib.aar/classes.dex.meta",
+    ] {
+        assert!(
+            !root.join(skipped).exists(),
+            "synthesis must skip {skipped} (opaque-plugin descendant)",
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Pin: a git submodule embedded in `Assets/` or `Packages/` is a
+/// separate repo whose contents we don't own. Synthesizing `.meta`
+/// files inside would dirty an unrelated working tree. Detect submodule
+/// roots by the sibling `.git` entry (file or dir) and skip descent.
+#[test]
+fn bake_does_not_synthesize_inside_git_submodules() {
+    let root = unique_tmp("submodule-skip");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+
+    // A "submodule" under Packages/<pkg>/<nested>/ — Unity wraps the
+    // upstream repo one level deep when the upstream isn't shaped as a
+    // package root. Real-world case: Packages/com.unity.build-report-inspector.
+    let sub = root.join("Packages/com.example.foo/upstream-repo");
+    fs::create_dir_all(&sub).unwrap();
+    // `.git` file pointing to the parent repo's gitdir — the canonical
+    // submodule marker.
+    write(&sub.join(".git"), "gitdir: ../../../.git/modules/foo\n");
+    write(&sub.join("README.md"), "hello\n");
+    write(&sub.join("src/lib.rs"), "fn main() {}\n");
+
+    // And one under Assets/ with a `.git` *directory* (worktree-style).
+    let sub2 = root.join("Assets/Vendor/ThirdParty");
+    fs::create_dir_all(sub2.join(".git")).unwrap();
+    write(&sub2.join(".git/HEAD"), "ref: refs/heads/main\n");
+    write(&sub2.join("README.md"), "vendor\n");
+    write(&sub2.join("src/foo.cs"), "// vendor\n");
+
+    bake_at(&root);
+
+    for skipped in [
+        "Packages/com.example.foo/upstream-repo/README.md.meta",
+        "Packages/com.example.foo/upstream-repo/src.meta",
+        "Packages/com.example.foo/upstream-repo/src/lib.rs.meta",
+        "Assets/Vendor/ThirdParty/README.md.meta",
+        "Assets/Vendor/ThirdParty/src.meta",
+        "Assets/Vendor/ThirdParty/src/foo.cs.meta",
+    ] {
+        assert!(
+            !root.join(skipped).exists(),
+            "synthesis must skip {skipped} (inside submodule)",
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn cache_file_lives_alongside_bin() {
     let root = unique_tmp("cache-file");

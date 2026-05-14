@@ -108,6 +108,19 @@ count follows when any were created. Direct children of `Packages/`
 Unity never authors metas for them. Pinned by
 `tests/bake.rs::bake_creates_missing_meta_files`.
 
+Two classes of folders are visited at the root but never descended into,
+so their contents stay free of synthesized metas:
+
+- **Folder-based Android plugins** — names ending in `.androidlib`,
+  `.androidpack`, or `.aar`. Unity hands the contents to Gradle untouched
+  and never authors per-file metas inside. See [Unity manual: Android
+  library project import](https://docs.unity3d.com/Manual/android-library-project-import.html).
+  Pinned by `tests/bake.rs::bake_does_not_synthesize_inside_opaque_android_plugin_folders`.
+- **Git submodule roots** — any directory with a sibling `.git` file or
+  directory. The subtree is owned by another repo; synthesizing metas
+  there would dirty an unrelated working tree. Pinned by
+  `tests/bake.rs::bake_does_not_synthesize_inside_git_submodules`.
+
 The bake is mtime-cached via `asset-db.cache.bin`: re-runs only re-parse
 files whose `.meta` or asset mtime has changed. On a 16k-entry project
 (meow-tower), cold ≈ 370 ms, warm ≈ 60 ms.

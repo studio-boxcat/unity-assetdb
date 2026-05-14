@@ -28,6 +28,12 @@ pub enum WalkError {
     AssetsMissing { path: PathBuf },
     #[error("walk error: {0}")]
     Walk(#[from] ignore::Error),
+    #[error("read dir {}: {source}", path.display())]
+    ReadDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Resolve a Unity project root: arg-given or climb up from CWD until we
@@ -149,6 +155,13 @@ where
 /// and `manifest.json` / `packages-lock.json` as virtual / unmanaged
 /// and never authors a `.meta` for them.
 ///
+/// Opaque subtrees — folder-based Android plugins (`.androidlib`,
+/// `.androidpack`, `.aar`) and git submodule roots — are visited at
+/// the root level (so the folder itself gets a synthesized `.meta` if
+/// absent) but never descended into. Unity hands Android plugin
+/// contents to Gradle untouched, and submodules are foreign repos
+/// whose working tree we shouldn't dirty.
+///
 /// Sequential (single-threaded) — the candidate set is small relative
 /// to the parallel `walk_meta_files` work, and synthesis I/O serializes
 /// on the same out-dir lock anyway.
@@ -160,11 +173,11 @@ where
     if !assets.is_dir() {
         return Err(WalkError::AssetsMissing { path: assets });
     }
-    walk_root_for_missing_meta(&assets, ASSETS_MIN_DEPTH, &mut visit)?;
+    walk_dir_for_missing_meta(&assets, 0, ASSETS_MIN_DEPTH, &mut visit)?;
 
     let packages = project_root.join("Packages");
     if packages.is_dir() {
-        walk_root_for_missing_meta(&packages, PACKAGES_MIN_DEPTH, &mut visit)?;
+        walk_dir_for_missing_meta(&packages, 0, PACKAGES_MIN_DEPTH, &mut visit)?;
     }
     Ok(())
 }
@@ -175,35 +188,82 @@ const ASSETS_MIN_DEPTH: usize = 1;
 /// `manifest.json` / `packages-lock.json` carry no `.meta`.
 const PACKAGES_MIN_DEPTH: usize = 2;
 
-fn walk_root_for_missing_meta<F>(
-    root: &Path,
+/// Manual recursive walker for the missing-meta pre-pass. Pre-order so
+/// the folder itself is reported before descent. Hand-rolled (not
+/// `ignore::Walk`) because we need to visit an opaque folder root then
+/// refuse to descend into it — a distinction `ignore`'s `filter_entry`
+/// can't express (filtering a dir suppresses both visit and recursion).
+fn walk_dir_for_missing_meta<F>(
+    dir: &Path,
+    depth: usize,
     min_depth: usize,
     visit: &mut F,
 ) -> Result<(), WalkError>
 where
     F: FnMut(&Path, bool),
 {
-    let walker = asset_walk_builder(root).build();
-    for res in walker {
-        let entry = res?;
-        if entry.depth() < min_depth {
+    let rd = std::fs::read_dir(dir).map_err(|source| WalkError::ReadDir {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for res in rd {
+        let entry = res.map_err(|source| WalkError::ReadDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        if is_unity_hidden(&name) {
             continue;
         }
-        let Some(ft) = entry.file_type() else { continue };
-        let is_dir = ft.is_dir();
-        let path = entry.path();
         // Skip any `.meta` entry (file or — pathologically — a dir
         // named `Foo.meta`); synthesizing `Foo.meta.meta` is never right.
-        if path.extension().is_some_and(|e| e == "meta") {
+        if Path::new(&name).extension().is_some_and(|e| e == "meta") {
             continue;
         }
-        let mut meta_os = path.as_os_str().to_owned();
-        meta_os.push(".meta");
-        if !Path::new(&meta_os).exists() {
-            visit(path, is_dir);
+        let ft = entry.file_type().map_err(|source| WalkError::ReadDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let is_dir = ft.is_dir();
+        let path = entry.path();
+        let entry_depth = depth + 1;
+        if entry_depth >= min_depth {
+            let mut meta_os = path.as_os_str().to_owned();
+            meta_os.push(".meta");
+            if !Path::new(&meta_os).exists() {
+                visit(&path, is_dir);
+            }
+        }
+        if is_dir && !is_opaque_subtree(&name, &path) {
+            walk_dir_for_missing_meta(&path, entry_depth, min_depth, visit)?;
         }
     }
     Ok(())
+}
+
+/// A directory whose *contents* should never receive synthesized
+/// `.meta` files: folder-based Android plugins (Unity hands them to
+/// Gradle as-is) and git submodule roots (foreign working trees).
+fn is_opaque_subtree(name: &std::ffi::OsStr, path: &Path) -> bool {
+    is_opaque_plugin_dir(name) || is_submodule_root(path)
+}
+
+/// Folder-based Android plugin names per Unity's manifest:
+/// `.androidlib` (Gradle module), `.androidpack` (Play Asset Delivery),
+/// `.aar` (folder form of an Android archive).
+/// <https://docs.unity3d.com/Manual/android-library-project-import.html>
+fn is_opaque_plugin_dir(name: &std::ffi::OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|e| e == "androidlib" || e == "androidpack" || e == "aar")
+}
+
+/// Git submodule (or nested independent repo) root: `<dir>/.git` exists
+/// as either a file (submodule pointer) or directory (worktree-style
+/// embedded repo). Either case means the subtree is owned by another
+/// repo and our synthesized `.meta` files would show up as dirty.
+fn is_submodule_root(dir: &Path) -> bool {
+    dir.join(".git").exists()
 }
 
 /// Shared `WalkBuilder` config for every asset walk in this crate.
