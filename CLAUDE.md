@@ -35,7 +35,7 @@ asset-catalog baker for the Unity client.
 ```sh
 just install                                   # cargo install --path . → ~/.cargo/bin/unity-assetdb
 
-# Bake the index.
+# Bake the index. Auto-synthesizes missing `.meta` files (see asset-database.md).
 unity-assetdb bake [--project <path>] [--out-dir <path>] [--scrub-chars <chars>]
 
 # Queries (TSV by default, --json opt-in). Exit 1 when nothing matches
@@ -81,8 +81,9 @@ for the invocation, baseline numbers, and per-phase semantics.
   chained context. Internal helpers in `bake.rs` still use `anyhow::Result`
   for ergonomic context chaining; the typed boundary is `pub fn bake` /
   `pub fn parse_one` / `pub fn register`.
-- **`register` minimal-meta assumption:** synthesizes the `<Importer>:`
-  block with only `externalObjects`/`userData`/`assetBundleName`/
+- **Minimal-meta assumption (shared by `register` + `bake`'s
+  missing-meta pre-pass):** synthesizes the `<Importer>:` block with
+  only `externalObjects`/`userData`/`assetBundleName`/
   `assetBundleVariant` fields. Unity, on next editor focus, re-imports
   the asset and rewrites the importer block with project defaults **while
   preserving the GUID**. If a specific importer config is needed (atlas

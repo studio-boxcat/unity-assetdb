@@ -100,23 +100,11 @@ where
     }
     let packages = project_root.join("Packages");
 
-    let mut builder = WalkBuilder::new(&assets);
+    let mut builder = asset_walk_builder(&assets);
     if packages.is_dir() {
         builder.add(&packages);
     }
-    // standard_filters(false): gitignore parsing in a Unity project is a
-    // net loss — Library/ + Temp/ + build artifacts live outside Assets/
-    // and Packages/. Inside-Assets `.gitignore` files exist (Zenject
-    // codegen, scratch dirs, SmartLibrary `.asset` exclusions) but Unity
-    // doesn't honor them either — gitignored .meta files still carry
-    // guids that prefabs can reference, so the asset DB must include
-    // them. See [Walker ignore behavior](docs/asset-database.md#populating).
-    // `is_unity_hidden` covers `.foo` and `foo~` per Unity's special-folder rule.
-    let walker = builder
-        .standard_filters(false)
-        .follow_links(false)
-        .filter_entry(|e| !is_unity_hidden(e.file_name()))
-        .build_parallel();
+    let walker = builder.build_parallel();
 
     let err: Arc<Mutex<Option<WalkError>>> = Arc::new(Mutex::new(None));
 
@@ -150,6 +138,90 @@ where
         return Err(e);
     }
     Ok(())
+}
+
+/// Visit every file/directory under `<project>/Assets/` and
+/// `<project>/Packages/<pkg>/` that is missing a sibling `.meta`,
+/// calling `visit(path, is_dir)` for each candidate.
+///
+/// Asset roots themselves (`Assets/`, `Packages/`) and direct children
+/// of `Packages/` are skipped — Unity treats embedded UPM package roots
+/// and `manifest.json` / `packages-lock.json` as virtual / unmanaged
+/// and never authors a `.meta` for them.
+///
+/// Sequential (single-threaded) — the candidate set is small relative
+/// to the parallel `walk_meta_files` work, and synthesis I/O serializes
+/// on the same out-dir lock anyway.
+pub fn walk_for_missing_meta<F>(project_root: &Path, mut visit: F) -> Result<(), WalkError>
+where
+    F: FnMut(&Path, bool),
+{
+    let assets = project_root.join("Assets");
+    if !assets.is_dir() {
+        return Err(WalkError::AssetsMissing { path: assets });
+    }
+    walk_root_for_missing_meta(&assets, ASSETS_MIN_DEPTH, &mut visit)?;
+
+    let packages = project_root.join("Packages");
+    if packages.is_dir() {
+        walk_root_for_missing_meta(&packages, PACKAGES_MIN_DEPTH, &mut visit)?;
+    }
+    Ok(())
+}
+
+/// Synthesize at every depth under `Assets/`.
+const ASSETS_MIN_DEPTH: usize = 1;
+/// Skip `Packages/` direct children — embedded UPM package roots and
+/// `manifest.json` / `packages-lock.json` carry no `.meta`.
+const PACKAGES_MIN_DEPTH: usize = 2;
+
+fn walk_root_for_missing_meta<F>(
+    root: &Path,
+    min_depth: usize,
+    visit: &mut F,
+) -> Result<(), WalkError>
+where
+    F: FnMut(&Path, bool),
+{
+    let walker = asset_walk_builder(root).build();
+    for res in walker {
+        let entry = res?;
+        if entry.depth() < min_depth {
+            continue;
+        }
+        let Some(ft) = entry.file_type() else { continue };
+        let is_dir = ft.is_dir();
+        let path = entry.path();
+        // Skip any `.meta` entry (file or — pathologically — a dir
+        // named `Foo.meta`); synthesizing `Foo.meta.meta` is never right.
+        if path.extension().is_some_and(|e| e == "meta") {
+            continue;
+        }
+        let mut meta_os = path.as_os_str().to_owned();
+        meta_os.push(".meta");
+        if !Path::new(&meta_os).exists() {
+            visit(path, is_dir);
+        }
+    }
+    Ok(())
+}
+
+/// Shared `WalkBuilder` config for every asset walk in this crate.
+///
+/// `standard_filters(false)`: gitignore parsing in a Unity project is a
+/// net loss — `Library/` + `Temp/` + build artifacts live outside
+/// `Assets/` and `Packages/`. Inside-Assets `.gitignore` files exist
+/// (Zenject codegen, scratch dirs, SmartLibrary `.asset` exclusions)
+/// but Unity doesn't honor them either — gitignored `.meta` files
+/// still carry guids that prefabs can reference, so the asset DB must
+/// include them. See [Walker ignore behavior](docs/asset-database.md#populating).
+/// `is_unity_hidden` covers `.foo` and `foo~` per Unity's special-folder rule.
+fn asset_walk_builder(root: &Path) -> WalkBuilder {
+    let mut b = WalkBuilder::new(root);
+    b.standard_filters(false)
+        .follow_links(false)
+        .filter_entry(|e| !is_unity_hidden(e.file_name()));
+    b
 }
 
 /// Unity-hidden file-name predicate: `.foo` or `foo~` per Unity's

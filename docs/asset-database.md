@@ -97,6 +97,17 @@ default `standard_filters`:
   outside the walker's roots (`Assets/`, `Packages/`), so they're
   never visited regardless of any ignore rules.
 
+**Missing-meta pre-pass** — before the parallel walk, bake scans the same
+two roots for files / folders lacking a sibling `.meta` and synthesizes
+one for each (delegating to `register::render_meta` / `register::generate_guid`).
+This mirrors Unity's editor-focus behavior, so a fresh bake works after
+dropping files into the project tree without opening the editor. Each
+synthesized path emits an info line through `on_progress`; a summary
+count follows when any were created. Direct children of `Packages/`
+(`manifest.json`, `packages-lock.json`, package-root dirs) are skipped —
+Unity never authors metas for them. Pinned by
+`tests/bake.rs::bake_creates_missing_meta_files`.
+
 The bake is mtime-cached via `asset-db.cache.bin`: re-runs only re-parse
 files whose `.meta` or asset mtime has changed. On a 16k-entry project
 (meow-tower), cold ≈ 370 ms, warm ≈ 60 ms.

@@ -28,7 +28,9 @@ use crate::store::{
     self, AssetDb, AssetEntry, AssetType, BakeCache, CachedAssetType, CachedEntry, StoreError,
     SubAsset, CACHE_FILENAME, DB_FILENAME,
 };
-use crate::walk::{walk_meta_files, WalkError};
+use crate::query::format_guid;
+use crate::register::{generate_guid, importer_for_path, render_meta};
+use crate::walk::{walk_for_missing_meta, walk_meta_files, WalkError};
 
 /// Errors from a bake run.
 ///
@@ -76,6 +78,9 @@ type NameSanitizerRef<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
 
 /// Borrowed view of a [`WarnSink`]. See [`NameSanitizerRef`].
 type WarnSinkRef<'a> = &'a (dyn Fn(&str) + Send + Sync);
+
+/// Borrowed view of a [`ProgressSink`]. See [`NameSanitizerRef`].
+type ProgressSinkRef<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
 /// File extensions whose asset has embedded sub-asset docs that should
 /// NOT join the global dedup pool — they live in the parent's namespace
@@ -332,6 +337,16 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
 
     let t_start = Instant::now();
 
+    // Pre-pass: synthesize a minimal `.meta` for every asset / folder
+    // under `Assets/` (and inside `Packages/<pkg>/`) that lacks one.
+    // Mirrors what Unity does on editor focus, so a fresh `bake` works
+    // against a project tree where someone dropped files in without
+    // opening the editor. See `crate::register` for the synthesized
+    // body — Unity rewrites the importer block on next focus while
+    // preserving the GUID.
+    synthesize_missing_metas(project_root, opts.on_progress.as_deref())
+        .context("synthesize missing .meta files")?;
+
     // Load bake-only cache. Missing/corrupt → empty (first bake or stale).
     let cache: CacheMap = match store::read_cache(&cache_file) {
         Ok(c) => build_cache(c),
@@ -456,6 +471,77 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Scan `Assets/` and `Packages/<pkg>/` for files/folders missing a
+/// sibling `.meta` and synthesize one for each — same minimal body
+/// `register` writes. Emits one info line per created file plus a
+/// summary line (when any were created) through `on_progress`.
+///
+/// Called from `bake_inner` before the main walk so freshly-authored
+/// metas join the same parse pass as pre-existing ones. The `bake`
+/// flock is held across the call, so we share the same concurrency
+/// guarantee as `register`.
+fn synthesize_missing_metas(
+    project_root: &Path,
+    on_progress: Option<ProgressSinkRef<'_>>,
+) -> Result<()> {
+    // Visitor can't return Result — stash the first failure and bubble
+    // it up so a partial bake never silently misses rows.
+    let mut created = 0usize;
+    let mut err: Option<anyhow::Error> = None;
+    walk_for_missing_meta(project_root, |path, is_dir| {
+        if err.is_some() {
+            return;
+        }
+        match write_minimal_meta(path, is_dir) {
+            Ok(true) => {
+                created += 1;
+                if let Some(sink) = on_progress {
+                    let rel = path
+                        .strip_prefix(project_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    sink(&format!("created .meta for {rel}"));
+                }
+            }
+            Ok(false) => {} // raced with another writer — fine.
+            Err(e) => err = Some(e),
+        }
+    })?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    if created > 0 && let Some(sink) = on_progress {
+        sink(&format!("created {created} missing .meta file(s)"));
+    }
+    Ok(())
+}
+
+/// Write a minimal `.meta` next to `path` with a fresh GUID. Returns
+/// `Ok(true)` when the file was created, `Ok(false)` when another
+/// writer beat us to it (`AlreadyExists`).
+fn write_minimal_meta(path: &Path, is_dir: bool) -> Result<bool> {
+    use std::io::Write;
+    let kind = importer_for_path(path, is_dir);
+    let guid = generate_guid().map_err(|e| anyhow::anyhow!("generate guid: {e}"))?;
+    let body = render_meta(&format_guid(guid), kind, is_dir);
+    let meta_path = with_meta_suffix(path);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&meta_path)
+    {
+        Ok(mut f) => {
+            f.write_all(body.as_bytes())
+                .with_context(|| format!("write meta: {}", meta_path.display()))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("create meta: {}", meta_path.display()))),
+    }
 }
 
 /// Single-asset parse, callable outside the parallel walk.

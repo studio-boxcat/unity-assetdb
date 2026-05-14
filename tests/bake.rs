@@ -768,6 +768,140 @@ fn walker_ignores_library_temp_and_unity_hidden() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// Pin: bake synthesizes a minimal `.meta` for any asset / folder that
+/// lacks one — matches Unity's editor-focus behavior so a fresh bake
+/// works after dropping files into the project tree.
+#[test]
+fn bake_creates_missing_meta_files() {
+    let root = unique_tmp("missing-meta");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+
+    // An asset file with NO sibling .meta.
+    write(
+        &root.join("Assets/New/Loose.prefab"),
+        "--- !u!1001 &100100000\nPrefabInstance: {}\n",
+    );
+    // A folder with NO sibling .meta either.
+    fs::create_dir_all(root.join("Assets/Empty")).unwrap();
+
+    // Unity-hidden entries (leading `.` / trailing `~`) — synthesis
+    // must skip these, matching the walker's `is_unity_hidden` filter.
+    write(
+        &root.join("Assets/.Hidden/Scratch.prefab"),
+        "--- !u!1001 &100100000\nPrefabInstance: {}\n",
+    );
+    write(
+        &root.join("Assets/Tilde~/Scratch.prefab"),
+        "--- !u!1001 &100100000\nPrefabInstance: {}\n",
+    );
+    // Direct child of Packages/ — must also be skipped (manifest.json
+    // shape) since Unity never authors metas there.
+    write(&root.join("Packages/manifest.json"), "{}\n");
+
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let progress_clone = std::sync::Arc::clone(&progress);
+    let opts = BakeOptions {
+        project_root: root.to_path_buf(),
+        out_dir: out_dir_for(&root),
+        name_sanitizer: None,
+        on_warn: None,
+        on_progress: Some(Box::new(move |m| {
+            progress_clone.lock().unwrap().push(m.to_string());
+        })),
+        verbose_timing: false,
+        verbose_collisions: false,
+    };
+    bake(&opts).unwrap();
+
+    // Meta files synthesized on disk.
+    assert!(
+        root.join("Assets/New/Loose.prefab.meta").exists(),
+        "Loose.prefab.meta not synthesized",
+    );
+    assert!(
+        root.join("Assets/Empty.meta").exists(),
+        "Empty.meta not synthesized",
+    );
+    // Intermediate folder (`Assets/New/`) is also covered.
+    assert!(
+        root.join("Assets/New.meta").exists(),
+        "New.meta not synthesized",
+    );
+
+    // Hidden subtrees and Packages/ direct-children must NOT get
+    // synthesized metas.
+    for skipped in [
+        "Assets/.Hidden.meta",
+        "Assets/.Hidden/Scratch.prefab.meta",
+        "Assets/Tilde~.meta",
+        "Assets/Tilde~/Scratch.prefab.meta",
+        "Packages/manifest.json.meta",
+    ] {
+        assert!(
+            !root.join(skipped).exists(),
+            "synthesis must skip {skipped}",
+        );
+    }
+
+    // Folder meta carries the folderAsset marker; file meta does not.
+    let empty_meta = fs::read_to_string(root.join("Assets/Empty.meta")).unwrap();
+    assert!(empty_meta.contains("folderAsset: yes"));
+    assert!(empty_meta.contains("DefaultImporter"));
+    let loose_meta = fs::read_to_string(root.join("Assets/New/Loose.prefab.meta")).unwrap();
+    assert!(!loose_meta.contains("folderAsset"));
+    assert!(loose_meta.contains("PrefabImporter"));
+
+    // Info log: per-file lines plus a summary count.
+    let logs = progress.lock().unwrap();
+    assert!(
+        logs.iter().any(|m| m.contains("created .meta for Assets/New/Loose.prefab")),
+        "missing per-file create log; logs={logs:?}",
+    );
+    assert!(
+        logs.iter().any(|m| m.contains("created") && m.contains("missing .meta")),
+        "missing summary log; logs={logs:?}",
+    );
+
+    // Loose.prefab is indexed; folder synthesis doesn't add entries.
+    let db = store::read(&db_file(&root)).unwrap();
+    assert_eq!(
+        db.entries.len(),
+        1,
+        "expected 1 entry (folder metas excluded), got {:?}",
+        db.entries,
+    );
+    let hints: Vec<&str> = db.entries.iter().map(|e| &*e.hint).collect();
+    assert_eq!(hints, vec!["Assets/New/Loose.prefab"]);
+
+    // Re-bake is idempotent — no new "created" log lines.
+    let progress2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let progress2_clone = std::sync::Arc::clone(&progress2);
+    let opts2 = BakeOptions {
+        project_root: root.to_path_buf(),
+        out_dir: out_dir_for(&root),
+        name_sanitizer: None,
+        on_warn: None,
+        on_progress: Some(Box::new(move |m| {
+            progress2_clone.lock().unwrap().push(m.to_string());
+        })),
+        verbose_timing: false,
+        verbose_collisions: false,
+    };
+    bake(&opts2).unwrap();
+    let logs2 = progress2.lock().unwrap();
+    assert!(
+        !logs2.iter().any(|m| m.contains("created .meta")),
+        "second bake should not synthesize; logs={logs2:?}",
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn cache_file_lives_alongside_bin() {
     let root = unique_tmp("cache-file");
