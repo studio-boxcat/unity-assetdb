@@ -633,12 +633,13 @@ fn process_one_uncached(
         }
     }
 
-    // Precedence: script_guid (MonoBehaviour-backed) > from_ext > top_class_id.
-    // `.prefab` and `.unity` deliberately let from_ext win — their YAML's first
-    // doc is a *contained* object (GameObject = classID 1), not the asset's
-    // class (Prefab = 1001). Falling back to top_class_id only for extensions
-    // without a stable class mapping (e.g. `.asset`, where the YAML peek is
-    // the only signal).
+    // Precedence: script_guid (MonoBehaviour-backed) > from_ext > top_class_id
+    // > `DefaultImporter` fallback (see `ClassId::DefaultAsset`).
+    // `.prefab` and `.unity` deliberately let from_ext win — their YAML's
+    // first doc is a *contained* object (GameObject = classID 1), not the
+    // asset's class (Prefab = 1001). Falling back to top_class_id only for
+    // extensions without a stable class mapping (e.g. `.asset`, where the
+    // YAML peek is the only signal).
     let asset_type_raw = if let Some(g) = script_guid {
         AssetTypeRaw::Script(g)
     } else if let Some(cls) = from_ext {
@@ -648,6 +649,8 @@ fn process_one_uncached(
     } else if let Some(cls) = top_class_id {
         // Unknown raw class ID — store anyway; lookup will treat as Native.
         AssetTypeRaw::Native(cls)
+    } else if meta_info.importer.as_deref() == Some("DefaultImporter") {
+        AssetTypeRaw::Native(ClassId::DefaultAsset as u32)
     } else {
         return Ok(None);
     };
@@ -1112,6 +1115,7 @@ mod tests {
             sprite_sheet: sprites,
             texture_type,
             sprite_mode,
+            importer: None,
         }
     }
 

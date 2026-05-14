@@ -39,6 +39,12 @@ pub enum ClassId {
     AudioMixerController = 244,
     Prefab = 1001,
     PrefabImporter = 1002,
+    /// Unity's catch-all class for any file imported by `DefaultImporter`
+    /// (extensions Unity has no dedicated importer for — `.swf`, `.fla`,
+    /// arbitrary binary blobs). Main sub-object lands at fileID
+    /// `1029 × 100_000 = 102_900_000` and is addressable from other YAML
+    /// as `{fileID: 102900000, guid: <metaGuid>, type: 3}`.
+    DefaultAsset = 1029,
     SceneAsset = 1032,
     LightingDataAsset = 1120,
     AssemblyDefinitionAsset = 1153,
@@ -83,6 +89,7 @@ impl ClassId {
             1001 => Self::Prefab,
             1002 => Self::PrefabImporter,
             1011 => Self::AvatarMask,
+            1029 => Self::DefaultAsset,
             1032 => Self::SceneAsset,
             1120 => Self::LightingDataAsset,
             1153 => Self::AssemblyDefinitionAsset,
@@ -124,6 +131,7 @@ impl ClassId {
             Self::Prefab => "Prefab",
             Self::PrefabImporter => "PrefabImporter",
             Self::AvatarMask => "AvatarMask",
+            Self::DefaultAsset => "DefaultAsset",
             Self::SceneAsset => "SceneAsset",
             Self::LightingDataAsset => "LightingDataAsset",
             Self::AssemblyDefinitionAsset => "AssemblyDefinitionAsset",
@@ -166,6 +174,7 @@ impl ClassId {
             "Prefab" => Self::Prefab,
             "PrefabImporter" => Self::PrefabImporter,
             "AvatarMask" => Self::AvatarMask,
+            "DefaultAsset" => Self::DefaultAsset,
             "SceneAsset" => Self::SceneAsset,
             "LightingDataAsset" => Self::LightingDataAsset,
             "AssemblyDefinitionAsset" => Self::AssemblyDefinitionAsset,

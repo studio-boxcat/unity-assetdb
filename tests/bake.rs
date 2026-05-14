@@ -299,6 +299,64 @@ TextureImporter:
     fs::remove_dir_all(&root).ok();
 }
 
+/// Files imported by Unity's `DefaultImporter` (any extension Unity
+/// doesn't have a dedicated importer for — `.swf`, `.dll` payloads,
+/// arbitrary binary blobs) materialize as a single `DefaultAsset`
+/// (classID 1029) at fileID 102900000. Without indexing them, every
+/// `{fileID: 102900000, guid: <swfGuid>, type: 3}` reference from a
+/// caller `.asset` fails to resolve downstream. Pins the contract
+/// after a meow-tower pull surfaced 34 unresolved `.swf` refs from
+/// the CatAnimations `*_*.asset` configs.
+#[test]
+fn default_importer_asset_indexed_as_default_asset() {
+    use unity_assetdb::class_id::ClassId;
+
+    let root = unique_tmp("default-importer");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+
+    // A `.swf` (or any file Unity falls back to DefaultImporter for) +
+    // its `.meta`.
+    write(&root.join("Assets/Swf/Cat.fla.swf"), "fake-swf-bytes");
+    write(
+        &root.join("Assets/Swf/Cat.fla.swf.meta"),
+        "fileFormatVersion: 2
+guid: c01ef0000864f41bdaacaf9939e97b36
+DefaultImporter:
+  externalObjects: {}
+  userData:
+  assetBundleName:
+  assetBundleVariant:
+",
+    );
+
+    let _out_dir = bake_at(&root);
+    let db = store::read(&db_file(&root)).unwrap();
+
+    let entry = db
+        .find_by_guid(0xc01ef0000864f41bdaacaf9939e97b36_u128)
+        .expect("DefaultImporter-imported asset missing from db");
+    assert_eq!(&*entry.name, "Cat.fla");
+    match entry.asset_type {
+        store::AssetType::Native(n) => {
+            assert_eq!(
+                n,
+                ClassId::DefaultAsset as u32,
+                "DefaultImporter assets should bake as Native(DefaultAsset)"
+            );
+        }
+        store::AssetType::Script(_) => {
+            panic!("expected Native(DefaultAsset), got {:?}", entry.asset_type)
+        }
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// Cache integrity: when neither the `.meta` nor the asset file mtime
 /// changed between bakes, the second bake reuses cached entries
 /// verbatim and produces a byte-identical `asset-db.bin`. Pins the

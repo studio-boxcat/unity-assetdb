@@ -31,6 +31,11 @@ pub struct MetaInfo {
     pub texture_type: Option<u32>,
     /// `TextureImporter.spriteMode`. None for non-texture importers.
     pub sprite_mode: Option<u32>,
+    /// Top-level importer block name (`DefaultImporter`, `TextureImporter`,
+    /// `PrefabImporter`, `NativeFormatImporter`, …) — the first un-indented
+    /// `<Name>Importer:` line. None when the `.meta` carries no importer
+    /// block (legacy / hand-written metas).
+    pub importer: Option<String>,
 }
 
 /// Parse a `.meta` file's text contents.
@@ -58,6 +63,19 @@ pub fn parse(text: &str) -> Result<MetaInfo, MetaParseError> {
 
     for line in text.lines() {
         let trimmed_left = line.trim_start();
+
+        // Top-level importer block: un-indented `<Name>Importer:` line.
+        // Caught before the `trim_start`-keyed scans below because indent
+        // is the discriminator (indented `Importer:` lines under e.g. a
+        // `Sprite:` sub-block would false-match without it).
+        if info.importer.is_none()
+            && line.len() == trimmed_left.len()
+            && let Some(name) = line.strip_suffix("Importer:")
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            info.importer = Some(format!("{name}Importer"));
+        }
 
         // Top-level key scans — INDEPENDENT of `in_sprites` state. Each
         // matches only when the line (after left-trim) starts with the
@@ -175,6 +193,35 @@ TextureImporter:
             info.sprite_sheet,
             vec![(11111, "spr_a".to_string()), (22222, "spr_b".to_string()),]
         );
+    }
+
+    #[test]
+    fn captures_top_level_importer_name() {
+        // `DefaultImporter` is the discriminator the bake's last-resort
+        // fallback keys on to classify `.swf` / `.fla` / other opaque
+        // blobs as `DefaultAsset` (classID 1029).
+        let text = "fileFormatVersion: 2
+guid: 7d602c2080b53413fa393df6b2c0af43
+DefaultImporter:
+  externalObjects: {}
+";
+        let info = parse(text).unwrap();
+        assert_eq!(info.importer.as_deref(), Some("DefaultImporter"));
+    }
+
+    #[test]
+    fn captures_first_importer_only_indented_lines_skipped() {
+        // Indented `<X>Importer:` keys (rare but appear in nested option
+        // blocks) must not clobber the top-level importer name.
+        let text = "fileFormatVersion: 2
+guid: 7d602c2080b53413fa393df6b2c0af43
+TextureImporter:
+  platformSettings:
+    overrideTextureSettings:
+      buildTargetImporter:
+";
+        let info = parse(text).unwrap();
+        assert_eq!(info.importer.as_deref(), Some("TextureImporter"));
     }
 
     #[test]
