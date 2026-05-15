@@ -46,35 +46,45 @@ Source: `BakeOptions::verbose_timing` in `src/bake.rs`.
 
 | Phase | Covers |
 |-------|--------|
-| `cache` | `store::read_cache` — decode `asset-db.cache.bin` into the in-memory `CacheMap` (HashMap). |
+| `cache` | Missing-meta pre-pass (`synthesize_missing_metas` — walks `Assets/` + `Packages/` once to find files lacking `.meta`) + `store::read_cache` (decode `asset-db.cache.bin` into the `CacheMap`). The pre-pass dominates on warm bakes where the cache decode is sub-3 ms; `UNITY_ASSETDB_TIMING=1` emits a `prepass=X cache_io=Y cache_decode=Z cache_map=W` sub-breakdown so a regression in either half is visible. |
 | `walk` | Parallel `ignore::WalkBuilder` traversal of `Assets/` + per-`.meta` `process_one` (mtime check, `.meta` parse, asset YAML peek, optional class-based sub-doc filter). Workers send results via `mpsc` channels. |
-| `build` | `build_db` — sub-asset dedup pass (type-aware bucketing, parent-dir suffix walk for collisions) + script-guid interning + final sort. |
+| `build` | `build_db` — sub-asset dedup pass (type-aware bucketing, depth-2 parent-dir suffix or GUID-prefix for MonoScripts) + script-guid interning + final sort. |
 | `write` | `store::write` + `store::write_cache` — bincode encode + file write. Shows `(skipped)` on the no-op path (every entry was a cache hit AND nothing dropped from the cache). |
 
-## Baseline numbers — meow-tower (18,169 entries, 20,560 `.meta` files)
+## Baseline numbers — meow-tower my-info (18,159 entries, 20,264 `.meta` files)
 
-Captured 2026-05-11 against
-[meow-tower](https://github.com/studio-boxcat/meow-tower)'s `Assets/`
-tree on an M-series mac (12 logical cores), post-optimization
-(`1b05485` single-pass parser + cache-hit stat trim, `da74104`
-walker `standard_filters` off). Numbers are 5-run hyperfine means
-with `--warmup 2`.
+Captured 2026-05-15 against
+[meow-tower](https://github.com/studio-boxcat/meow-tower)'s `my-info`
+worktree on an M-series mac (12 logical cores), post-optimization
+(`6632c12` GUID-suffix MonoScript rule, `<pending>` pre-pass two-stage
+read_dir + `build_cache` hint clone elimination). Numbers are
+hyperfine means with `--warmup 2`.
 
 | Scenario | Total | Notes |
 |----------|------:|-------|
-| **Cold, OS cache cold** | ~800 ms | First bake after a fresh checkout; every `.meta`/`.asset` read hits disk. Dominated by `walk` (~770 ms). |
-| **Warm (full hit)** | 64 ms ± 5 ms | Every entry from `asset-db.cache.bin`; `write` skips the no-op path. |
+| **Cold, OS cache cold** | ~720 ms | First bake after a fresh checkout; every `.meta`/`.asset` read hits disk. Dominated by parallel walk + parse. |
+| **Warm (full hit)** | ~190 ms wall / ~95 ms `bake_inner` | Every entry from `asset-db.cache.bin`; `write` skips the no-op path. Hyperfine wall-clock includes process spawn + dynamic linker; the internal phase total is the tighter signal. |
 
-### Per-phase breakdown
+### Per-phase breakdown (warm, internal timing)
 
 ```
-warm:  walked=20560 hit=18169 parsed=0
-       cache=3.5ms walk=34.6ms build=17.5ms write=(skipped) total=55.6ms
-
-cold:  walked=20560 hit=0 parsed=18169
-       cache=0.0ms walk=745ms build=18.4ms write=5.9ms total=769ms
-       (OS cache cold; warm-OS rerun after this writes ~400ms)
+warm:  walked=20264 hit=18159 parsed=0
+       prepass=48ms cache_io=0.3ms cache_decode=1.2ms cache_map=1.8ms
+       cache=52ms walk=32ms build=18ms write=(skipped) total=102ms
 ```
+
+The pre-pass `read_dir` traversal is now the single dominant phase on
+warm bakes. Optimizations applied:
+
+- **Two-stage `walk_dir_for_missing_meta`** (was ~85 ms): collect names
+  into an `AHashSet` once per directory, then test meta-presence via
+  hash lookup instead of a `Path::exists()` stat per non-meta entry.
+  Eliminated ~40k stat calls on the meow-tower tree.
+- **`build_cache` hint allocation halved**: the HashMap key already
+  carries the hint; the cached value's `hint` field is left empty and
+  `process_one` re-stamps it from the lookup key on a hit. Saves one
+  String alloc per cached entry (~18k allocs on warm). Pinned by
+  `tests/bake.rs::cache_hit_preserves_hint`.
 
 ### Query + register subcommands
 

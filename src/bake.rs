@@ -246,12 +246,17 @@ fn build_cache(cache: BakeCache) -> CacheMap {
             CachedAssetType::Native(n) => AssetTypeRaw::Native(n),
             CachedAssetType::Script(g) => AssetTypeRaw::Script(g),
         };
+        // The HashMap key duplicates the value's hint. Storing the same
+        // string twice burns 18k extra allocations on a warm bake; instead,
+        // leave hint empty in the cached value and stamp it from the key
+        // when `process_one` clones the entry on a cache hit. RawEntry's
+        // hint field is the consumer of record.
         let hint = String::from(e.hint);
         let raw = RawEntry {
             guid: e.guid,
             asset_type_raw,
-            hint: hint.clone(),
-            name: String::new(), // re-derived in build_db
+            hint: String::new(),
+            name: String::new(),
             meta_mtime_ns: e.meta_mtime_ns,
             asset_mtime_ns: e.asset_mtime_ns,
             sub_assets: e.sub_assets,
@@ -344,14 +349,21 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
     // opening the editor. See `crate::register` for the synthesized
     // body — Unity rewrites the importer block on next focus while
     // preserving the GUID.
+    let t_prepass = Instant::now();
     synthesize_missing_metas(project_root, opts.on_progress.as_deref())
         .context("synthesize missing .meta files")?;
+    let dt_prepass = t_prepass.elapsed();
 
     // Load bake-only cache. Missing/corrupt → empty (first bake or stale).
-    let cache: CacheMap = match store::read_cache(&cache_file) {
-        Ok(c) => build_cache(c),
-        Err(_) => AHashMap::new(),
-    };
+    let t_cache_io = Instant::now();
+    let cache_bytes = std::fs::read(&cache_file).ok();
+    let dt_cache_io = t_cache_io.elapsed();
+    let t_cache_decode = Instant::now();
+    let cache_decoded = cache_bytes.as_deref().and_then(|b| store::decode_cache(b).ok());
+    let dt_cache_decode = t_cache_decode.elapsed();
+    let t_cache_map = Instant::now();
+    let cache: CacheMap = cache_decoded.map(build_cache).unwrap_or_default();
+    let dt_cache_map = t_cache_map.elapsed();
     let cache_size = cache.len();
     let t_cache = t_start.elapsed();
 
@@ -460,6 +472,9 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
             let walked_n = walked.load(Ordering::Relaxed);
             let parsed_n = db.entries.len() - hit_n;
             let write_phase = if no_op { "skipped" } else { "wrote" };
+            sink(&format!(
+                "  prepass={dt_prepass:?} cache_io={dt_cache_io:?} cache_decode={dt_cache_decode:?} cache_map={dt_cache_map:?}",
+            ));
             sink(&format!(
                 "  walked={walked_n} hit={hit_n} parsed={parsed_n} | cache={:?} walk={:?} build={:?} write={:?} ({write_phase}) total={:?}",
                 t_cache,
@@ -639,7 +654,12 @@ fn process_one(
         && cached.meta_mtime_ns == meta_mtime_ns
     {
         cache_hits.fetch_add(1, Ordering::Relaxed);
-        return Ok(Some(cached.clone()));
+        // `cached.hint` is intentionally empty (see `build_cache`) — the
+        // hit's hint is the one we computed above, identical bytes either
+        // way. One allocation per hit instead of two.
+        let mut out = cached.clone();
+        out.hint = hint;
+        return Ok(Some(out));
     }
 
     // Cache miss. Now stat the companion — handles directory-`.meta`

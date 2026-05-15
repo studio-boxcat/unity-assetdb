@@ -204,10 +204,24 @@ fn walk_dir_for_missing_meta<F>(
 where
     F: FnMut(&Path, bool),
 {
+    // Two-stage read of each directory: first pass collects every entry
+    // and the set of `.meta` filenames present, second pass tests
+    // candidates against that set. This eliminates one stat call per
+    // entry — the original `Path::exists()` check on `<name>.meta`
+    // dominated warm-bake wall-clock time (~80 ms on a 20k-file project)
+    // even when no synthesis was needed.
+    use std::ffi::OsString;
     let rd = std::fs::read_dir(dir).map_err(|source| WalkError::ReadDir {
         path: dir.to_path_buf(),
         source,
     })?;
+    struct Candidate {
+        name: OsString,
+        path: PathBuf,
+        is_dir: bool,
+    }
+    let mut metas: ahash::AHashSet<OsString> = ahash::AHashSet::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     for res in rd {
         let entry = res.map_err(|source| WalkError::ReadDir {
             path: dir.to_path_buf(),
@@ -217,13 +231,19 @@ where
         if is_unity_hidden(&name) {
             continue;
         }
-        // Skip any `.meta` entry (file or — pathologically — a dir
-        // named `Foo.meta`); synthesizing `Foo.meta.meta` is never right.
-        // Also skip blacklisted-extension files (`.md`, `.pspec`) — they
-        // carry no Unity import semantics, and a synthesized `.meta`
-        // would pollute the asset-db's name pool.
+        // `Foo.meta` → record the bare name `Foo` so the candidate test
+        // is a hash lookup, not a stat. Skip blacklisted-extension files
+        // (`.md`, `.pspec`, …) — they carry no Unity import semantics,
+        // and synthesizing a `.meta` would pollute the asset-db's name
+        // pool.
         if let Some(ext) = Path::new(&name).extension() {
-            if ext == "meta" || is_blacklisted_extension(ext) {
+            if ext == "meta" {
+                if let Some(stem) = Path::new(&name).file_stem() {
+                    metas.insert(stem.to_owned());
+                }
+                continue;
+            }
+            if is_blacklisted_extension(ext) {
                 continue;
             }
         }
@@ -231,18 +251,21 @@ where
             path: dir.to_path_buf(),
             source,
         })?;
-        let is_dir = ft.is_dir();
-        let path = entry.path();
-        let entry_depth = depth + 1;
-        if entry_depth >= min_depth {
-            let mut meta_os = path.as_os_str().to_owned();
-            meta_os.push(".meta");
-            if !Path::new(&meta_os).exists() {
-                visit(&path, is_dir);
-            }
+        candidates.push(Candidate {
+            name,
+            path: entry.path(),
+            is_dir: ft.is_dir(),
+        });
+    }
+    let entry_depth = depth + 1;
+    for c in &candidates {
+        if entry_depth >= min_depth && !metas.contains(&c.name) {
+            visit(&c.path, c.is_dir);
         }
-        if is_dir && !is_opaque_subtree(&name, &path) {
-            walk_dir_for_missing_meta(&path, entry_depth, min_depth, visit)?;
+    }
+    for c in candidates {
+        if c.is_dir && !is_opaque_subtree(&c.name, &c.path) {
+            walk_dir_for_missing_meta(&c.path, entry_depth, min_depth, visit)?;
         }
     }
     Ok(())

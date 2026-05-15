@@ -201,6 +201,140 @@ fn cache_reuse_preserves_names() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// Pin: warm-bake hint integrity. `build_cache` leaves `RawEntry.hint`
+/// empty on the cached value and `process_one` re-stamps it from the
+/// HashMap key on a cache hit — one fewer allocation per warm hit. If
+/// either side regresses, the post-warm asset-db.bin carries
+/// empty/wrong hints. Asserts every entry's hint matches the source
+/// fixture path AND survives an arbitrary number of warm rebakes.
+#[test]
+fn cache_hit_preserves_hint() {
+    let root = unique_tmp("cache-hint");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    // Cold bake builds the cache.
+    let _out_dir = bake_at(&root);
+    let cold = store::read(&db_file(&root)).unwrap();
+
+    // Three warm bakes — every hint must be non-empty and stable.
+    for _ in 0..3 {
+        let _out_dir = bake_at(&root);
+        let warm = store::read(&db_file(&root)).unwrap();
+        assert_eq!(cold.entries.len(), warm.entries.len());
+        for (c, w) in cold.entries.iter().zip(warm.entries.iter()) {
+            assert_eq!(c.guid, w.guid);
+            assert!(!w.hint.is_empty(), "warm-bake hint went empty for guid {:032x}", w.guid);
+            assert_eq!(&*c.hint, &*w.hint, "warm-bake hint drifted for guid {:032x}", w.guid);
+        }
+    }
+
+    // And the fixture paths show up in the indexed hints.
+    let hints: std::collections::HashSet<&str> =
+        cold.entries.iter().map(|e| e.hint.as_ref()).collect();
+    assert!(hints.contains("Assets/UI/Foo.prefab"), "expected fixture hint, got: {hints:?}");
+    assert!(hints.contains("Assets/SO/Bar.asset"), "expected fixture hint, got: {hints:?}");
+    assert!(hints.contains("Assets/Tex/Sheet.png"), "expected fixture hint, got: {hints:?}");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Pin: missing-meta pre-pass is idempotent across re-bakes. The
+/// optimized walker reads each directory once and tests meta presence
+/// via a hash set — a regression that drops candidates from the set
+/// (e.g. wrong stem extraction) would manifest as the second bake
+/// synthesizing metas the first bake already created. Asserts:
+///   1. Cold bake creates exactly one .meta per real fixture asset.
+///   2. Second bake creates zero new metas (mtime of every existing
+///      .meta unchanged).
+///   3. Pre-pass correctly handles subdirectories — adds a nested asset
+///      without a .meta and confirms it gets synthesized.
+#[test]
+fn prepass_walker_idempotent_and_descends_subdirs() {
+    let root = unique_tmp("prepass-idempotent");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+
+    // One file with .meta (pre-pass should skip), one without (pre-pass
+    // should synthesize). Subdir with the same shape — descent check.
+    write(&root.join("Assets/A/HasMeta.prefab"), "%YAML 1.1\n--- !u!1001 &100100000\nPrefabInstance:\n");
+    write(
+        &root.join("Assets/A/HasMeta.prefab.meta"),
+        "fileFormatVersion: 2\nguid: aaaa1111aaaa1111aaaa1111aaaa1111\nPrefabImporter: {}\n",
+    );
+    write(&root.join("Assets/A/Sub/Nested.prefab"), "%YAML 1.1\n--- !u!1001 &100100000\nPrefabInstance:\n");
+    // Nested.prefab has no .meta — pre-pass must synthesize one.
+    write(&root.join("Assets/B/Lone.prefab"), "%YAML 1.1\n--- !u!1001 &100100000\nPrefabInstance:\n");
+    // Lone.prefab has no .meta either — top-level synthesis.
+
+    let _out_dir = bake_at(&root);
+
+    // Existing HasMeta.prefab.meta untouched.
+    assert!(root.join("Assets/A/HasMeta.prefab.meta").exists());
+    // Synthesized metas exist for the two .prefab files that lacked them.
+    let nested_meta = root.join("Assets/A/Sub/Nested.prefab.meta");
+    let lone_meta = root.join("Assets/B/Lone.prefab.meta");
+    assert!(nested_meta.exists(), "pre-pass did not descend into Assets/A/Sub/");
+    assert!(lone_meta.exists(), "pre-pass missed Assets/B/Lone.prefab");
+
+    // Idempotency: capture mtimes, second bake leaves them untouched.
+    let nested_mtime_before = mtime_ns_of(&nested_meta);
+    let lone_mtime_before = mtime_ns_of(&lone_meta);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let _out_dir = bake_at(&root);
+    assert_eq!(nested_mtime_before, mtime_ns_of(&nested_meta));
+    assert_eq!(lone_mtime_before, mtime_ns_of(&lone_meta));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Pin: cache→bin round-trip preserves sub_asset rows verbatim. The
+/// `build_cache` refactor stripped `hint` from the cached RawEntry but
+/// must leave every other field (guid, asset_type, sub_assets) intact.
+/// A regression that nulled sub_assets would silently drop sprite-sheet
+/// rows on warm bakes.
+#[test]
+fn cache_round_trips_sub_assets() {
+    let root = unique_tmp("cache-subassets");
+    let _ = fs::remove_dir_all(&root);
+    make_fixture(&root);
+
+    // make_fixture's Sheet.png has 2 sprite-sheet sub-assets.
+    let _out_dir = bake_at(&root);
+    let cold = store::read(&db_file(&root)).unwrap();
+    let cold_sheet = cold
+        .entries
+        .iter()
+        .find(|e| e.guid == 0xdddd4444dddd4444dddd4444dddd4444_u128)
+        .expect("Sheet.png missing from cold bake");
+    assert_eq!(
+        cold_sheet.sub_assets.len(),
+        2,
+        "expected 2 sprite-sheet sub-assets, got: {:?}",
+        cold_sheet.sub_assets,
+    );
+
+    let _out_dir = bake_at(&root); // warm
+    let warm = store::read(&db_file(&root)).unwrap();
+    let warm_sheet = warm
+        .entries
+        .iter()
+        .find(|e| e.guid == 0xdddd4444dddd4444dddd4444dddd4444_u128)
+        .expect("Sheet.png missing from warm bake");
+    assert_eq!(warm_sheet.sub_assets.len(), 2);
+    for (c, w) in cold_sheet.sub_assets.iter().zip(warm_sheet.sub_assets.iter()) {
+        assert_eq!(c.file_id, w.file_id);
+        assert_eq!(c.class_id, w.class_id);
+        assert_eq!(&*c.name, &*w.name);
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn duplicate_top_level_guid_hard_fails() {
     // Two .meta sharing a GUID (hand-edited copy-paste) — neither under a
