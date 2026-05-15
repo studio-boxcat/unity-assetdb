@@ -888,7 +888,7 @@ fn build_db(
     for r in raw.iter_mut() {
         let top_type = r.asset_type_raw;
         if contested(&r.name, top_type) {
-            let new_name = parent_suffix(&r.hint, &r.name, MIN_PARENTS)?;
+            let new_name = collision_suffix(top_type, &r.hint, &r.name, r.guid)?;
             if verbose_collisions && let Some(sink) = on_warn {
                 sink(&format!(
                     "warning: name collision on `{}` (guid {:032x}); renamed to `{}`",
@@ -909,7 +909,7 @@ fn build_db(
             let sub_type = AssetTypeRaw::Native(sub.class_id);
             if contested(&sub.name, sub_type) {
                 let original = sub.name.to_string();
-                let new_name = parent_suffix(&r.hint, &original, MIN_PARENTS)?;
+                let new_name = collision_suffix(sub_type, &r.hint, &original, r.guid)?;
                 if verbose_collisions && let Some(sink) = on_warn {
                     sink(&format!(
                         "warning: sub-asset name collision on `{}` (parent guid {:032x}); renamed to `{}`",
@@ -1113,6 +1113,40 @@ fn claim(
             Ok(())
         }
     }
+}
+
+/// Pick the collision-disambiguation suffix for a contested entry.
+/// `.cs` MonoScript filenames are conventional Unity classnames whose
+/// downstream lookups go through GUIDs regardless, so mirror-package
+/// vendoring (UniTask vs Zenject both shipping a `Runtime/Utils/L.cs`)
+/// routinely produces depth-2 path collisions — the GUID-prefix suffix
+/// sidesteps the problem entirely. Every other asset type gets the
+/// path-based depth-2 suffix where the surrounding directories are
+/// meaningful.
+fn collision_suffix(t: AssetTypeRaw, hint: &str, stem: &str, guid: u128) -> Result<String> {
+    if matches!(t, AssetTypeRaw::Native(c) if c == ClassId::MonoScript as u32) {
+        return Ok(guid_suffix(stem, guid));
+    }
+    parent_suffix(hint, stem, MIN_PARENTS)
+}
+
+/// Length of the GUID-prefix suffix used by [`guid_suffix`]. 8 hex chars
+/// = 32 bits = ~0.01% birthday-collision odds at N=1000 — comfortable
+/// headroom for typical projects.
+const GUID_SUFFIX_LEN: usize = 8;
+
+/// Suffix `stem` with the first 8 hex chars of `guid`: `L^9ddf5ad8`.
+/// Used for contested structural assets (see [`uses_guid_suffix`])
+/// where path-based suffixing fails on mirror-package vendoring. Alias
+/// is intrinsic to the asset: survives `git mv` and is independent of
+/// sibling churn.
+///
+/// 8-hex collisions across two distinct GUIDs are exceptionally rare;
+/// when they do happen, [`claim`] still hard-fails — the user can
+/// regenerate one of the colliding script GUIDs to resolve.
+fn guid_suffix(stem: &str, guid: u128) -> String {
+    let hex = format_guid(guid);
+    format!("{stem}^{}", &hex[..GUID_SUFFIX_LEN])
 }
 
 /// Compute a contested entry's alias as `stem^<last min_parents parents>`.
@@ -1344,6 +1378,19 @@ mod tests {
     }
 
     #[test]
+    fn guid_suffix_uses_first_8_hex_of_guid() {
+        // `.cs` MonoScripts collide structurally (mirror-package vendoring:
+        // UniTask/Runtime/Utils/L.cs vs Zenject/Runtime/Utils/L.cs). The
+        // GUID-suffix rule sidesteps the path-based depth-2 ambiguity
+        // entirely: alias is intrinsic to the asset (survives `git mv`).
+        let guid = 0x9ddf5ad82f894638a9ba6a59eb87d508_u128;
+        assert_eq!(guid_suffix("L", guid), "L^9ddf5ad8");
+
+        let guid_b = 0x3751098bb0c541e296a07628e24fcb84_u128;
+        assert_eq!(guid_suffix("L", guid_b), "L^3751098b");
+    }
+
+    #[test]
     fn parent_suffix_hard_fails_when_no_parent_segments() {
         // Hint is a bare filename — nothing to suffix with. Must error
         // rather than silently fall back to a guid suffix.
@@ -1459,6 +1506,41 @@ mod tests {
         assert_eq!(&*b_name_two, &*b_name_three);
         assert_eq!(&*a_name_two, "Foo^X/Y");
         assert_eq!(&*b_name_two, "Foo^P/Q");
+    }
+
+    /// Pin: contested `.cs` MonoScripts use a GUID-prefix suffix instead of
+    /// depth-2 parent dirs. Sidesteps mirror-package collisions (UniTask
+    /// vs Zenject both vendoring a `Runtime/Utils/L.cs` at the same depth-2
+    /// path) where the path-based rule would hard-fail. The suffix is
+    /// intrinsic to the asset (first 8 hex of GUID) — independent of
+    /// directory layout, stable under `git mv`.
+    #[test]
+    fn build_db_uses_guid_suffix_for_contested_monoscripts() {
+        let a_guid = 0x9ddf5ad82f894638a9ba6a59eb87d508_u128;
+        let b_guid = 0x3751098bb0c541e296a07628e24fcb84_u128;
+        let raw = vec![
+            RawEntry {
+                guid: a_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::MonoScript as u32),
+                hint: "Packages/com.boxcat.libs/UniTask/Runtime/Utils/L.cs".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+            RawEntry {
+                guid: b_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::MonoScript as u32),
+                hint: "Packages/com.boxcat.libs/Zenject/Runtime/Utils/L.cs".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        assert_eq!(&*db.find_by_guid(a_guid).unwrap().name, "L^9ddf5ad8");
+        assert_eq!(&*db.find_by_guid(b_guid).unwrap().name, "L^3751098b");
     }
 
     /// Pin: two contestants whose hints share the same depth-2 parent path

@@ -305,12 +305,20 @@ pub(crate) fn is_unity_hidden(name: &std::ffi::OsStr) -> bool {
 /// keeps the name pool focused on real assets and avoids spurious
 /// `.meta` synthesis for documentation and tool source files.
 ///
-/// Current set: `md` (markdown docs) and `pspec` (pspec serializer source).
-/// Match is case-sensitive — Unity itself is case-sensitive for asset
-/// paths on Linux build agents, and a `.MD` file is rare enough not to
-/// warrant a normalization step here.
+/// Current set: `md` (markdown docs), `pspec` (pspec serializer source),
+/// `py` / `exe` (vendored tool helpers shipped inside UPM packages, e.g.
+/// Firebase's `generate_xml_from_google_services_json`), `pdb` (debug
+/// symbol files paired with managed `.dll` plugins), `asmdef` / `asmref`
+/// (Unity assembly-definition assets — GUID-identified by downstream
+/// consumers, vendored packages routinely ship `Editor/Assembly.asmref`
+/// at identical depth-2 paths). Match is case-sensitive — Unity itself
+/// is case-sensitive for asset paths on Linux build agents, and a `.MD`
+/// / `.PY` file is rare enough not to warrant a normalization step here.
 fn is_blacklisted_extension(ext: &std::ffi::OsStr) -> bool {
-    ext == "md" || ext == "pspec"
+    matches!(
+        ext.as_encoded_bytes(),
+        b"md" | b"pspec" | b"py" | b"exe" | b"pdb" | b"asmdef" | b"asmref",
+    )
 }
 
 /// `Foo.md.meta` → `true`; `Foo.prefab.meta` → `false`.
@@ -346,8 +354,12 @@ mod tests {
     /// the bake excludes them from indexing entirely.
     #[test]
     fn is_blacklisted_extension_known_set() {
-        assert!(is_blacklisted_extension(OsStr::new("md")));
-        assert!(is_blacklisted_extension(OsStr::new("pspec")));
+        for ext in ["md", "pspec", "py", "exe", "pdb", "asmdef", "asmref"] {
+            assert!(
+                is_blacklisted_extension(OsStr::new(ext)),
+                "{ext} should be blacklisted",
+            );
+        }
     }
 
     #[test]

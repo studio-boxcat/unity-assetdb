@@ -109,10 +109,19 @@ Unity never authors metas for them. Pinned by
 `tests/bake.rs::bake_creates_missing_meta_files`.
 
 **Blacklisted-extension exclusion** — files with non-asset extensions
-(`.md` docs, `.pspec` source) are skipped by both the meta walker (their
-existing `.meta` is not indexed) and the missing-meta pre-pass (no
-`.meta` synthesized). The companion `Foo.prefab` is still indexed; only
-the sibling `Foo.prefab.md` and `Foo.prefab.pspec` are excluded.
+are skipped by both the meta walker (their existing `.meta` is not
+indexed) and the missing-meta pre-pass (no `.meta` synthesized).
+Companion real assets are still indexed; only the sibling blacklisted
+file is dropped. Current set:
+
+| Ext | Why |
+|-----|-----|
+| `.md` | Markdown docs co-located with assets. |
+| `.pspec` | pspec serializer source files. |
+| `.py`, `.exe` | Vendored tool helpers inside UPM packages (e.g. Firebase's `generate_xml_from_google_services_json`). |
+| `.pdb` | Debug symbol sidecars paired with managed `.dll` plugins. |
+| `.asmdef`, `.asmref` | Unity assembly-definition assets — GUID-identified by consumers; vendored packages routinely ship `Editor/Assembly.asmref` at identical depth-2 paths. |
+
 Predicate lives in `walk::is_blacklisted_extension`; pinned by
 `walk::tests::is_blacklisted_extension_*` and
 `tests/bake.rs::bake_excludes_sidecar_md_and_pspec_files`.
@@ -184,7 +193,7 @@ addressing scheme.
 asset_type)` pair, **every** claimant gets renamed. Nobody keeps the bare
 alias. Single-owner names within a `(name, asset_type)` bucket stay bare.
 
-**Depth-2 suffix rule:** each contested entry's alias is
+**Depth-2 suffix rule (default):** each contested entry's alias is
 `stem^<last-2-parent-dirs-of-hint>`, joined with `/`. The suffix is a pure
 function of the entry's own hint — no `taken`-map consultation, no
 order-dependence:
@@ -198,6 +207,17 @@ order-dependence:
 Hints with fewer than 2 parent segments take whatever's available
 (`Assets/Foo.prefab` → `Foo^Assets`). Hints with zero parent segments
 hard-fail — no suffix possible.
+
+**GUID-suffix rule for `.cs` MonoScripts:** contested `Native(MonoScript)`
+entries use `stem^<first-8-hex-of-guid>` instead of the path-based rule
+(`L^9ddf5ad8`, `L^3751098b`, …). MonoScript filenames are conventional
+Unity classnames whose downstream lookups go through GUIDs regardless,
+and mirror-package vendoring (UniTask vs. Zenject both shipping a
+`Runtime/Utils/L.cs`) makes the path-based depth-2 alias structurally
+ambiguous. The GUID suffix is intrinsic to the asset — survives `git mv`
+and is independent of sibling churn. 8 hex chars = ~0.01% birthday-
+collision odds at N=1000; on the rare collision the bake still
+hard-fails and the user can regenerate one of the GUIDs.
 
 **Hard-fail on shared depth-2 parent.** Two contestants whose hints share
 the same last 2 parent dirs (e.g. `Assets/X/Y/Foo.prefab` and
@@ -220,7 +240,8 @@ The `^` separator is rare in Unity asset paths and (unlike parens) doesn't
 collide with naturally-paren-named assets like `QuestWidget (Side).prefab`.
 
 Pinned by `bake::tests::parent_suffix_*` (pure-helper semantics),
-`bake::tests::build_db_renames_every_claimant_when_name_is_contested`
+`bake::tests::guid_suffix_uses_first_8_hex_of_guid` + `build_db_uses_guid_suffix_for_contested_monoscripts`
+(MonoScript carve-out), `bake::tests::build_db_renames_every_claimant_when_name_is_contested`
 (no-winner rule), `build_db_contested_alias_is_independent_of_other_siblings`
 (stability), and `build_db_fails_when_two_contestants_share_depth_2_parent`
 (hard-fail).
