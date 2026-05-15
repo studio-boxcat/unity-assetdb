@@ -164,9 +164,15 @@ where
 /// contents to Gradle untouched, and submodules are foreign repos
 /// whose working tree we shouldn't dirty.
 ///
-/// Sequential (single-threaded) — the candidate set is small relative
-/// to the parallel `walk_meta_files` work, and synthesis I/O serializes
-/// on the same out-dir lock anyway.
+/// Parallelism: each top-level subdirectory of `Assets/` and
+/// `Packages/<pkg>/` is walked in its own thread via [`std::thread::scope`].
+/// `read_dir` syscalls dominate the pre-pass on warm bakes (no synthesis
+/// I/O on the happy path), and the directories are independent so the
+/// scheduler gets near-linear speedup on multi-core. Hits are collected
+/// per-thread then visited sequentially in the calling thread — keeps
+/// the visitor `FnMut` (synthesize closes over a mutable counter and
+/// `Option<Error>`) and the synthesis writes serialized (each meta is a
+/// rename-over-tmp; serial keeps the out-dir flock contention predictable).
 pub fn walk_for_missing_meta<F>(project_root: &Path, mut visit: F) -> Result<(), WalkError>
 where
     F: FnMut(&Path, bool),
@@ -175,13 +181,113 @@ where
     if !assets.is_dir() {
         return Err(WalkError::AssetsMissing { path: assets });
     }
-    walk_dir_for_missing_meta(&assets, 0, ASSETS_MIN_DEPTH, &mut visit)?;
+    let hits = walk_root_parallel(&assets, ASSETS_MIN_DEPTH)?;
+    for (path, is_dir) in hits {
+        visit(&path, is_dir);
+    }
 
     let packages = project_root.join("Packages");
     if packages.is_dir() {
-        walk_dir_for_missing_meta(&packages, 0, PACKAGES_MIN_DEPTH, &mut visit)?;
+        let hits = walk_root_parallel(&packages, PACKAGES_MIN_DEPTH)?;
+        for (path, is_dir) in hits {
+            visit(&path, is_dir);
+        }
     }
     Ok(())
+}
+
+/// Per-subtree return shape: pairs of `(path-missing-meta, is_dir)`.
+/// `walk_root_parallel` collects these across threads, then sorts before
+/// returning so the call order of `visit` is deterministic across runs
+/// (a precondition for byte-stable bake output even when synthesis fires).
+type MissingMetaHits = Vec<(PathBuf, bool)>;
+
+/// Walk a root directory's immediate subdirectories in parallel. Files
+/// directly under `root` are walked sequentially in the calling thread
+/// (a Unity project has few of these — `manifest.json`/`packages-lock.json`
+/// at the `Packages/` root, the occasional stray under `Assets/`). The
+/// subtree walks (the bulk of the work) run concurrently via
+/// [`std::thread::scope`].
+fn walk_root_parallel(root: &Path, min_depth: usize) -> Result<MissingMetaHits, WalkError> {
+    use std::ffi::OsString;
+    let rd = std::fs::read_dir(root).map_err(|source| WalkError::ReadDir {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    // Collect root-level state in one pass (mirrors `walk_dir_for_missing_meta`).
+    struct RootEntry {
+        name: OsString,
+        path: PathBuf,
+        is_dir: bool,
+    }
+    let mut metas: ahash::AHashSet<OsString> = ahash::AHashSet::new();
+    let mut root_entries: Vec<RootEntry> = Vec::new();
+    for res in rd {
+        let entry = res.map_err(|source| WalkError::ReadDir {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        if is_unity_hidden(&name) {
+            continue;
+        }
+        if let Some(ext) = Path::new(&name).extension() {
+            if ext == "meta" {
+                if let Some(stem) = Path::new(&name).file_stem() {
+                    metas.insert(stem.to_owned());
+                }
+                continue;
+            }
+            if is_blacklisted_extension(ext) {
+                continue;
+            }
+        }
+        let ft = entry.file_type().map_err(|source| WalkError::ReadDir {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        root_entries.push(RootEntry {
+            name,
+            path: entry.path(),
+            is_dir: ft.is_dir(),
+        });
+    }
+
+    let root_depth = 1usize;
+    let mut hits: MissingMetaHits = Vec::new();
+
+    // Root-level visits (files or opaque-folder roots at depth 1).
+    for e in &root_entries {
+        if root_depth >= min_depth && !metas.contains(&e.name) {
+            hits.push((e.path.clone(), e.is_dir));
+        }
+    }
+
+    // Subtrees in parallel. Each thread walks its assigned subdirectory
+    // sequentially and returns its own hit vec; the calling thread joins
+    // and merges.
+    std::thread::scope(|s| -> Result<(), WalkError> {
+        let mut handles: Vec<std::thread::ScopedJoinHandle<'_, Result<MissingMetaHits, WalkError>>> =
+            Vec::new();
+        for e in &root_entries {
+            if e.is_dir && !is_opaque_subtree(&e.name, &e.path) {
+                let path = e.path.clone();
+                handles.push(s.spawn(move || {
+                    let mut local: MissingMetaHits = Vec::new();
+                    walk_dir_collect(&path, root_depth, min_depth, &mut local)?;
+                    Ok(local)
+                }));
+            }
+        }
+        for h in handles {
+            let sub = h.join().expect("walk-subtree thread panicked")?;
+            hits.extend(sub);
+        }
+        Ok(())
+    })?;
+
+    hits.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(hits)
 }
 
 /// Synthesize at every depth under `Assets/`.
@@ -190,20 +296,20 @@ const ASSETS_MIN_DEPTH: usize = 1;
 /// `manifest.json` / `packages-lock.json` carry no `.meta`.
 const PACKAGES_MIN_DEPTH: usize = 2;
 
-/// Manual recursive walker for the missing-meta pre-pass. Pre-order so
+/// Recursive subtree walker for the missing-meta pre-pass. Pre-order so
 /// the folder itself is reported before descent. Hand-rolled (not
 /// `ignore::Walk`) because we need to visit an opaque folder root then
 /// refuse to descend into it — a distinction `ignore`'s `filter_entry`
 /// can't express (filtering a dir suppresses both visit and recursion).
-fn walk_dir_for_missing_meta<F>(
+///
+/// Single-threaded — called per-subtree from `walk_root_parallel` which
+/// forks one thread per top-level directory.
+fn walk_dir_collect(
     dir: &Path,
     depth: usize,
     min_depth: usize,
-    visit: &mut F,
-) -> Result<(), WalkError>
-where
-    F: FnMut(&Path, bool),
-{
+    hits: &mut MissingMetaHits,
+) -> Result<(), WalkError> {
     // Two-stage read of each directory: first pass collects every entry
     // and the set of `.meta` filenames present, second pass tests
     // candidates against that set. This eliminates one stat call per
@@ -260,12 +366,12 @@ where
     let entry_depth = depth + 1;
     for c in &candidates {
         if entry_depth >= min_depth && !metas.contains(&c.name) {
-            visit(&c.path, c.is_dir);
+            hits.push((c.path.clone(), c.is_dir));
         }
     }
     for c in candidates {
         if c.is_dir && !is_opaque_subtree(&c.name, &c.path) {
-            walk_dir_for_missing_meta(&c.path, entry_depth, min_depth, visit)?;
+            walk_dir_collect(&c.path, entry_depth, min_depth, hits)?;
         }
     }
     Ok(())

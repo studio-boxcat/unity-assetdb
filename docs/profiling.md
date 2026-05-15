@@ -3,10 +3,17 @@
 > **Related:** [`asset-database.md`](asset-database.md) (the artifact + bake
 > pipeline being profiled).
 
-One recipe in the project [justfile]:
+Three recipes in the project [justfile]:
 
 - **`just profile`** — wall-clock cold/warm + per-phase timings via
   [hyperfine] + the built-in `UNITY_ASSETDB_TIMING=1` phase counter.
+- **`just bench`** — isolated phase microbenches: `examples/bench_bake.rs`
+  for the bake pipeline (cache decode, pre-pass walk, full warm bake) and
+  `examples/bench_list.rs` for the query/emit hot path. Useful when phase
+  noise drowns out a wall-clock signal.
+- **`just compare BEFORE AFTER`** — builds release binaries from two refs
+  (in throwaway worktrees) and runs cold + warm hyperfine head-to-head.
+  Strips the manual checkout-rebuild dance.
 
 Defaults to `MEOW_CLIENT=/Users/jameskim/Develop/meow-tower`. Override
 via env: `MEOW_CLIENT=/path/to/other/project just profile`.
@@ -62,29 +69,41 @@ hyperfine means with `--warmup 2`.
 
 | Scenario | Total | Notes |
 |----------|------:|-------|
-| **Cold, OS cache cold** | ~720 ms | First bake after a fresh checkout; every `.meta`/`.asset` read hits disk. Dominated by parallel walk + parse. |
-| **Warm (full hit)** | ~190 ms wall / ~95 ms `bake_inner` | Every entry from `asset-db.cache.bin`; `write` skips the no-op path. Hyperfine wall-clock includes process spawn + dynamic linker; the internal phase total is the tighter signal. |
+| **Cold, OS cache cold** | 396 ms ± 9 | First bake after a fresh checkout; every `.meta`/`.asset` read hits disk. Dominated by parallel walk + parse. |
+| **Warm (full hit)** | 76 ms ± 1 | Every entry from `asset-db.cache.bin`; `write` skips the no-op path. |
 
 ### Per-phase breakdown (warm, internal timing)
 
 ```
-warm:  walked=20264 hit=18159 parsed=0
-       prepass=48ms cache_io=0.3ms cache_decode=1.2ms cache_map=1.8ms
-       cache=52ms walk=32ms build=18ms write=(skipped) total=102ms
+warm:  walked=20249 hit=18144 parsed=0
+       prepass=22ms cache_io=0.3ms cache_decode=1.1ms cache_map=1.1ms
+       cache=25ms walk=29ms build=17ms write=(skipped) total=71ms
 ```
 
-The pre-pass `read_dir` traversal is now the single dominant phase on
-warm bakes. Optimizations applied:
+Walk is now the largest phase (per-`.meta` stat + cache lookup × 20k).
+Optimizations applied this session:
 
-- **Two-stage `walk_dir_for_missing_meta`** (was ~85 ms): collect names
-  into an `AHashSet` once per directory, then test meta-presence via
-  hash lookup instead of a `Path::exists()` stat per non-meta entry.
-  Eliminated ~40k stat calls on the meow-tower tree.
+- **Parallel missing-meta pre-pass** (~42 ms → ~22 ms): top-level
+  subdirectories of `Assets/` and `Packages/<pkg>/` walked concurrently
+  via `std::thread::scope`. Hits are merged + sorted in the caller so
+  visit order stays deterministic. Synthesis writes remain serial.
+- **Two-stage `walk_dir_collect`** (was ~85 ms before either change):
+  collect names into an `AHashSet` once per directory, then test
+  meta-presence via hash lookup instead of a `Path::exists()` stat per
+  non-meta entry. Eliminated ~40k stat calls on the meow-tower tree.
 - **`build_cache` hint allocation halved**: the HashMap key already
   carries the hint; the cached value's `hint` field is left empty and
   `process_one` re-stamps it from the lookup key on a hit. Saves one
   String alloc per cached entry (~18k allocs on warm). Pinned by
   `tests/bake.rs::cache_hit_preserves_hint`.
+
+### Session-over-session change
+
+```
+                pre-session (6632c12)   post-session    Δ
+cold (5 runs):  551 ms ± 27             396 ms ± 9      −28%
+warm (10 runs): 124 ms ± 2              76 ms ± 1       −39%
+```
 
 ### Query + register subcommands
 
