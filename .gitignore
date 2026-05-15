@@ -1,3 +1,11 @@
 /target
 **/*.bak
 .DS_Store
+# Solo-maintained tool; external coworkers consume the built binary/dylib via
+# FFI (from meow-tower / meow-toolbox), not the source. No shared-build
+# reproducibility need, and the local-checkout patches in ~/.cargo/config.toml
+# add `[[patch.unused]]` markers to every cargo run, so a tracked lockfile
+# would churn on every invocation. Each `just install` regenerates a fresh
+# lockfile locally. If a transitive dep ever needs pinning, do it in
+# Cargo.toml via `cargo update -p <crate> --precise <ver>`.
+Cargo.lock
