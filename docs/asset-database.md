@@ -46,12 +46,12 @@ Each `AssetEntry`:
 | `guid` | `u128` | 32-hex Unity GUID. |
 | `asset_type` | `AssetType` | Tagged enum — `Native(class_id)` or `Script(script_idx)`. See [Asset typing](#asset-typing). |
 | `name` | `Box<str>` | Filename stem (with optional collision suffix). See [Name collisions](#name-collisions). |
-| `sub_assets` | `Vec<SubAsset { file_id: i64, name: Box<str> }>` | Sub-asset rows (sprite-sheet entries, sub-clips, plus the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures — fileID `21300000` = `ClassId::Sprite × 100_000`, name = filename stem; synthesized at bake since `.meta` omits it). Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
+| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Sub-asset rows (sprite-sheet entries, sub-clips, plus the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures — fileID `21300000` = `ClassId::Sprite × 100_000`, name = filename stem; synthesized at bake since `.meta` omits it). `class_id` stored explicitly so prefab-embedded sub-asset rows (whose hashed fileIDs would otherwise collapse via the `file_id / 100_000` heuristic) retain their real Unity class. Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
 | `hint` | `Box<str>` | Project-root-relative path (`Assets/Foo.prefab`, `Packages/com.boxcat.libs/Bar.mixer`). Lets downstream consumers locate assets by guid without re-walking the project tree. |
 
 `Box<str>` instead of `String` saves 8 bytes per string (no growable-capacity field) once decoded.
 
-**`asset-db.cache.bin`** — bake-only side file. Same magic-prefixed bincode envelope. Each entry: `(hint, meta_mtime_ns, asset_mtime_ns, guid, asset_type, sub_assets)`. Hint here is the cache lookup key; everything else lets a re-bake reconstruct the entry without re-parsing the .meta + asset. `name` is **not** cached — it's re-derived from the hint's filename stem and re-disambiguated against the live name table on every bake (so collision-suffixes don't compound across runs).
+**`asset-db.cache.bin`** — bake-only side file. Same magic-prefixed bincode envelope. Each entry: `(hint, meta_mtime_ns, asset_mtime_ns, guid, asset_type, sub_assets)`. Hint here is the cache lookup key; everything else lets a re-bake reconstruct the entry without re-parsing the .meta + asset. `name` is **not** cached — it's re-derived from the hint's filename stem and re-applied to the [Name collisions](#name-collisions) rule on every bake, so the bare ↔ suffix promote/demote stays current as siblings come and go.
 
 ### Asset typing
 
@@ -107,6 +107,15 @@ count follows when any were created. Direct children of `Packages/`
 (`manifest.json`, `packages-lock.json`, package-root dirs) are skipped —
 Unity never authors metas for them. Pinned by
 `tests/bake.rs::bake_creates_missing_meta_files`.
+
+**Blacklisted-extension exclusion** — files with non-asset extensions
+(`.md` docs, `.pspec` source) are skipped by both the meta walker (their
+existing `.meta` is not indexed) and the missing-meta pre-pass (no
+`.meta` synthesized). The companion `Foo.prefab` is still indexed; only
+the sibling `Foo.prefab.md` and `Foo.prefab.pspec` are excluded.
+Predicate lives in `walk::is_blacklisted_extension`; pinned by
+`walk::tests::is_blacklisted_extension_*` and
+`tests/bake.rs::bake_excludes_sidecar_md_and_pspec_files`.
 
 Two classes of folders are visited at the root but never descended into,
 so their contents stay free of synthesized metas:
@@ -172,23 +181,49 @@ prefab's namespace and consumers resolve them through a parent-scoped
 addressing scheme.
 
 **No-winner rule:** when ≥ 2 distinct guids claim the same `(name,
-asset_type)` pair, **every** claimant gets renamed via the parent-dir
-suffix walk. Nobody keeps the bare alias. This trades a slightly noisier
-alias for byte-stable output: there's no "first hint wins" bias to track,
-and renaming an unrelated asset can never rotate which collider holds the
-bare form. Single-owner names within a `(name, asset_type)` bucket stay
-bare.
+asset_type)` pair, **every** claimant gets renamed. Nobody keeps the bare
+alias. Single-owner names within a `(name, asset_type)` bucket stay bare.
 
-Disambiguation walks the nearest unique parent-dir, joined with `^`:
-`Dependencies` → `Dependencies^Editor` →
-`Dependencies^com.google.play.review/Editor`. Hard-fails if no parent suffix
-produces a unique name — ambiguity surfaces at bake time rather than getting
-papered over with a guid suffix.
+**Depth-2 suffix rule:** each contested entry's alias is
+`stem^<last-2-parent-dirs-of-hint>`, joined with `/`. The suffix is a pure
+function of the entry's own hint — no `taken`-map consultation, no
+order-dependence:
 
-The order is deterministic (entries sorted by hint), so suffixes don't churn
-between bakes. The `^` separator is rare in Unity asset paths and (unlike
-parens) doesn't collide with naturally-paren-named assets like
-`QuestWidget (Side).prefab`.
+| Hint | Alias |
+|------|-------|
+| `Assets/10_UIElements/04_Prefabs/Button.prefab` | `Button^10_UIElements/04_Prefabs` |
+| `Assets/20_Contents/SettingsPopup/Prefabs/Button.prefab` | `Button^SettingsPopup/Prefabs` |
+| `Assets/20_Contents/WaitForUpdatesPopup/Prefabs/Button.prefab` | `Button^WaitForUpdatesPopup/Prefabs` |
+
+Hints with fewer than 2 parent segments take whatever's available
+(`Assets/Foo.prefab` → `Foo^Assets`). Hints with zero parent segments
+hard-fail — no suffix possible.
+
+**Hard-fail on shared depth-2 parent.** Two contestants whose hints share
+the same last 2 parent dirs (e.g. `Assets/X/Y/Foo.prefab` and
+`Pkg/X/Y/Foo.prefab`) compute identical aliases. The bake aborts with both
+hints + the asset type in the error; the user renames one in source. No
+silent fallback to deeper suffix — that's the order-dependent drift the
+depth-2 rule exists to kill.
+
+**What stays stable / what still drifts.** A contested entry's alias is
+independent of which siblings exist: adding or removing an unrelated
+co-colliding asset never perturbs the others. The only remaining drift is
+the bare ↔ suffix promote/demote at the contest boundary: a previously
+unique `Foo` flips to `Foo^P/Q` the moment a second `Foo` lands anywhere,
+and the surviving entry pops back to bare if the sibling is later removed.
+Persisting an alias of a contested asset across bakes is safe; persisting
+bare aliases that *could* become contested is not. GUIDs remain the only
+truly stable identifier.
+
+The `^` separator is rare in Unity asset paths and (unlike parens) doesn't
+collide with naturally-paren-named assets like `QuestWidget (Side).prefab`.
+
+Pinned by `bake::tests::parent_suffix_*` (pure-helper semantics),
+`bake::tests::build_db_renames_every_claimant_when_name_is_contested`
+(no-winner rule), `build_db_contested_alias_is_independent_of_other_siblings`
+(stability), and `build_db_fails_when_two_contestants_share_depth_2_parent`
+(hard-fail).
 
 The bake also hard-fails if any `(name, guid, fileID, asset_type)` tuple
 appears twice in the final database — a defensive invariant that surfaces

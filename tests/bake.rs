@@ -1046,3 +1046,65 @@ fn cache_file_lives_alongside_bin() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// Sidecar files (`.md` documentation, `.pspec` source for the pspec tool)
+/// live next to real Unity assets but are not themselves assets. The bake
+/// excludes them entirely:
+///   1. Existing `.md.meta` / `.pspec.meta` files are skipped by the
+///      meta-walker → no entries in `asset-db.bin`.
+///   2. Bare `.md` / `.pspec` files without sibling `.meta` are skipped by
+///      the missing-meta pre-pass → no `.meta` synthesized for them.
+/// The companion real asset (`Foo.prefab`) is unaffected.
+#[test]
+fn bake_excludes_sidecar_md_and_pspec_files() {
+    let root = unique_tmp("sidecar-exclude");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+
+    // Real asset — should be indexed.
+    write(
+        &root.join("Assets/UI/Foo.prefab"),
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &100100000\nPrefabInstance:\n  m_ObjectHideFlags: 0\n",
+    );
+    write(
+        &root.join("Assets/UI/Foo.prefab.meta"),
+        "fileFormatVersion: 2\nguid: aaaa1111aaaa1111aaaa1111aaaa1111\nPrefabImporter:\n  externalObjects: {}\n",
+    );
+
+    // (1) Sidecar with an existing `.meta` — meta walker must skip it.
+    write(&root.join("Assets/UI/Foo.prefab.md"), "# Docs\n");
+    write(
+        &root.join("Assets/UI/Foo.prefab.md.meta"),
+        "fileFormatVersion: 2\nguid: bbbb2222bbbb2222bbbb2222bbbb2222\nDefaultImporter:\n  externalObjects: {}\n",
+    );
+
+    // (2) Sidecar without a `.meta` — missing-meta pre-pass must not synthesize one.
+    write(&root.join("Assets/UI/Foo.prefab.pspec"), "{}\n");
+
+    let _out_dir = bake_at(&root);
+
+    let db = store::read(&db_file(&root)).unwrap();
+    assert_eq!(
+        db.entries.len(),
+        1,
+        "only the .prefab should be indexed, got: {:?}",
+        db.entries.iter().map(|e| &*e.hint).collect::<Vec<_>>(),
+    );
+    assert!(db.find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128).is_some());
+    assert!(
+        db.find_by_guid(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128).is_none(),
+        ".md sidecar must not enter the asset-db",
+    );
+
+    // The pspec sidecar must NOT have a synthesized `.meta`.
+    assert!(
+        !root.join("Assets/UI/Foo.prefab.pspec.meta").exists(),
+        "missing-meta pre-pass should not synthesize a .meta for `.pspec` sidecars",
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

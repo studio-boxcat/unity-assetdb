@@ -128,7 +128,9 @@ where
             };
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 let path = entry.path();
-                if path.extension().is_some_and(|e| e == "meta") {
+                if path.extension().is_some_and(|e| e == "meta")
+                    && !meta_targets_blacklisted_ext(path)
+                {
                     visit(path);
                 }
             }
@@ -217,8 +219,13 @@ where
         }
         // Skip any `.meta` entry (file or — pathologically — a dir
         // named `Foo.meta`); synthesizing `Foo.meta.meta` is never right.
-        if Path::new(&name).extension().is_some_and(|e| e == "meta") {
-            continue;
+        // Also skip blacklisted-extension files (`.md`, `.pspec`) — they
+        // carry no Unity import semantics, and a synthesized `.meta`
+        // would pollute the asset-db's name pool.
+        if let Some(ext) = Path::new(&name).extension() {
+            if ext == "meta" || is_blacklisted_extension(ext) {
+                continue;
+            }
         }
         let ft = entry.file_type().map_err(|source| WalkError::ReadDir {
             path: dir.to_path_buf(),
@@ -292,9 +299,38 @@ pub(crate) fn is_unity_hidden(name: &std::ffi::OsStr) -> bool {
     bytes.first() == Some(&b'.') || bytes.last() == Some(&b'~')
 }
 
+/// File extensions the asset-db refuses to index. Files with these
+/// extensions exist inside `Assets/` (often as siblings of real assets)
+/// but carry no Unity import semantics worth tracking — excluding them
+/// keeps the name pool focused on real assets and avoids spurious
+/// `.meta` synthesis for documentation and tool source files.
+///
+/// Current set: `md` (markdown docs) and `pspec` (pspec serializer source).
+/// Match is case-sensitive — Unity itself is case-sensitive for asset
+/// paths on Linux build agents, and a `.MD` file is rare enough not to
+/// warrant a normalization step here.
+fn is_blacklisted_extension(ext: &std::ffi::OsStr) -> bool {
+    ext == "md" || ext == "pspec"
+}
+
+/// `Foo.md.meta` → `true`; `Foo.prefab.meta` → `false`.
+///
+/// Inspects the "inner" extension of a `.meta` path — i.e. the extension
+/// of the path with `.meta` stripped. Used by [`walk_meta_files`] to
+/// skip `.meta` files that belong to blacklisted-extension assets before
+/// they enter the parser pipeline. Borrow-only — runs once per `.meta`
+/// in the project, so no per-entry allocation.
+fn meta_targets_blacklisted_ext(meta_path: &Path) -> bool {
+    meta_path
+        .file_stem()
+        .and_then(|s| Path::new(s).extension())
+        .is_some_and(is_blacklisted_extension)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn rejects_non_project() {
@@ -303,5 +339,36 @@ mod tests {
         let result = resolve_project_root(Some(&tmp));
         assert!(result.is_err());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Recognized non-asset extensions: markdown docs and pspec source
+    /// files. These sit inside `Assets/` but are not themselves assets —
+    /// the bake excludes them from indexing entirely.
+    #[test]
+    fn is_blacklisted_extension_known_set() {
+        assert!(is_blacklisted_extension(OsStr::new("md")));
+        assert!(is_blacklisted_extension(OsStr::new("pspec")));
+    }
+
+    #[test]
+    fn is_blacklisted_extension_rejects_real_assets() {
+        for ext in ["prefab", "asset", "png", "controller", "mat", "anim", "txt", "json"] {
+            assert!(
+                !is_blacklisted_extension(OsStr::new(ext)),
+                "{ext} should NOT be classified as blacklisted",
+            );
+        }
+    }
+
+    #[test]
+    fn meta_targets_blacklisted_ext_inspects_inner_extension() {
+        // `Foo.md.meta` → blacklisted; `Foo.prefab.meta` → asset.
+        assert!(meta_targets_blacklisted_ext(Path::new("UI/Foo.md.meta")));
+        assert!(meta_targets_blacklisted_ext(Path::new("UI/Foo.pspec.meta")));
+        assert!(!meta_targets_blacklisted_ext(Path::new("UI/Foo.prefab.meta")));
+        assert!(!meta_targets_blacklisted_ext(Path::new("UI/Foo.asset.meta")));
+        // A bare `.meta` (no inner extension) is malformed but must not
+        // be misclassified as blacklisted.
+        assert!(!meta_targets_blacklisted_ext(Path::new("Foo.meta")));
     }
 }

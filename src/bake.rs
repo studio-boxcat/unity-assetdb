@@ -876,15 +876,19 @@ fn build_db(
     };
 
     // Pass 2: walk entries in hint-sorted order, renaming every contested
-    // claim. `taken` tracks `(name, asset_type) → guid` pairs already
-    // claimed in this pass so the disambiguator never picks a candidate
-    // that collides with an earlier (different-guid) entry of the same
-    // type; same-guid sharing remains allowed.
-    let mut taken: AHashMap<(String, AssetTypeRaw), u128> = AHashMap::with_capacity(raw.len());
+    // claim via `parent_suffix` (depth-2, pure function of own hint). The
+    // post-hoc `taken` map tracks `(name, asset_type) → (guid, hint)` and
+    // hard-fails when two distinct-guid claimants compute the same suffix
+    // (e.g. hints sharing the same last 2 parent segments); the recorded
+    // hint feeds the error so the user sees both colliding paths.
+    // Same-guid sharing remains allowed.
+    let mut taken: AHashMap<(String, AssetTypeRaw), (u128, String)> =
+        AHashMap::with_capacity(raw.len());
+
     for r in raw.iter_mut() {
         let top_type = r.asset_type_raw;
         if contested(&r.name, top_type) {
-            let new_name = disambiguate(&r.name, &r.hint, r.guid, top_type, &taken)?;
+            let new_name = parent_suffix(&r.hint, &r.name, MIN_PARENTS)?;
             if verbose_collisions && let Some(sink) = on_warn {
                 sink(&format!(
                     "warning: name collision on `{}` (guid {:032x}); renamed to `{}`",
@@ -893,17 +897,7 @@ fn build_db(
             }
             r.name = new_name;
         }
-        match taken.get(&(r.name.clone(), top_type)) {
-            Some(&prev) if prev != r.guid => anyhow::bail!(
-                "asset-db: name `{}` claimed by both guid {:032x} and {prev:032x} \
-                 after dedup — `disambiguate` produced a non-unique alias",
-                r.name,
-                r.guid,
-            ),
-            _ => {
-                taken.insert((r.name.clone(), top_type), r.guid);
-            }
-        }
+        claim(&mut taken, &r.name, top_type, r.guid, &r.hint)?;
 
         if is_embedded_container(&r.hint) {
             // Prefab-embedded sub-assets bypass the global dedup pool;
@@ -915,7 +909,7 @@ fn build_db(
             let sub_type = AssetTypeRaw::Native(sub.class_id);
             if contested(&sub.name, sub_type) {
                 let original = sub.name.to_string();
-                let new_name = disambiguate(&original, &r.hint, r.guid, sub_type, &taken)?;
+                let new_name = parent_suffix(&r.hint, &original, MIN_PARENTS)?;
                 if verbose_collisions && let Some(sink) = on_warn {
                     sink(&format!(
                         "warning: sub-asset name collision on `{}` (parent guid {:032x}); renamed to `{}`",
@@ -924,13 +918,7 @@ fn build_db(
                 }
                 sub.name = new_name.into_boxed_str();
             }
-            // Same-guid sharing is allowed — a sub-asset's deduped name
-            // will often equal the parent's deduped alias (same hint
-            // feeds disambiguate), and that's the desired outcome.
-            let key = (sub.name.to_string(), sub_type);
-            if !taken.contains_key(&key) {
-                taken.insert(key, r.guid);
-            }
+            claim(&mut taken, &sub.name, sub_type, r.guid, &r.hint)?;
         }
     }
 
@@ -1078,54 +1066,89 @@ fn filename_stem_from_hint(hint: &str) -> String {
         .to_string()
 }
 
-/// Pick a unique alias for `stem` given `hint` and an existing `taken` map.
-/// Strategy: try `stem^dir` for successively-deeper parent dirs. A candidate
-/// is considered "free" iff it's absent from `taken` *or* already mapped to
-/// `owner_guid` (the latter covers the same-guid sub-asset case where the
-/// parent's deduped top-level alias is a valid name to share).
+/// Depth of the parent-suffix the dedup pass uses when an alias is
+/// contested. Structural rule, not a tuning knob — see
+/// [Name collisions](docs/asset-database.md#name-collisions).
+const MIN_PARENTS: usize = 2;
+
+/// Render an `AssetTypeRaw` as a human-readable string for diagnostics.
+/// Mirrors [`crate::query::asset_type_str`] but operates on the
+/// pre-intern raw form (carries the script GUID directly) — used in
+/// bake-side error messages where the [`crate::store::AssetDb`] hasn't
+/// been finalized yet.
+fn asset_type_raw_str(t: AssetTypeRaw) -> String {
+    match t {
+        AssetTypeRaw::Native(n) => match ClassId::from_raw(n) {
+            Some(c) => c.name().to_string(),
+            None => format!("Native:{n}"),
+        },
+        AssetTypeRaw::Script(g) => format!("Script:{}", format_guid(g)),
+    }
+}
+
+/// Post-hoc dedup-pool claim. Inserts `(name, asset_type) → (guid, hint)`
+/// into `taken`; tolerates same-guid re-claims (a sub-asset sharing the
+/// parent's deduped alias). Bails when a distinct-guid claim collides —
+/// the recorded hint of the prior claimant feeds the error so the user
+/// sees both colliding paths.
+fn claim(
+    taken: &mut AHashMap<(String, AssetTypeRaw), (u128, String)>,
+    name: &str,
+    t: AssetTypeRaw,
+    guid: u128,
+    hint: &str,
+) -> Result<()> {
+    match taken.get(&(name.to_string(), t)) {
+        Some((prev_guid, _)) if *prev_guid == guid => Ok(()),
+        Some((prev_guid, prev_hint)) => anyhow::bail!(
+            "asset-db: cannot disambiguate name `{name}` (asset_type {ty}) — \
+             two assets share the same depth-{MIN_PARENTS} parent suffix:\n  \
+             {prev_hint} (guid {prev_guid:032x})\n  \
+             {hint} (guid {guid:032x})\n\
+             Rename one in source.",
+            ty = asset_type_raw_str(t),
+        ),
+        None => {
+            taken.insert((name.to_string(), t), (guid, hint.to_string()));
+            Ok(())
+        }
+    }
+}
+
+/// Compute a contested entry's alias as `stem^<last min_parents parents>`.
 ///
-/// `asset_type` scopes the dedup bucket — a candidate is "taken" only when
-/// another guid has claimed the exact `(name, asset_type)` pair. Two assets
-/// of different `asset_type` (e.g. Texture2D `Foo.png` vs Prefab `Foo.prefab`)
-/// share the bare alias `Foo` without contesting because the codec layer
-/// uses the field's declared C# type to pick the right one at lookup time.
+/// Pure function of `hint`: no `taken` map, no `owner_guid`, no order
+/// dependence. The shape of the suffix doesn't change when sibling claimants
+/// are added or removed elsewhere in the project — the stability win over
+/// the prior "shortest-suffix wins among contestants" rule.
 ///
-/// Hard-fails when no parent segment yields a free candidate — ambiguity
-/// surfaces at bake time rather than getting papered over with a guid suffix.
+/// `min_parents` is a soft floor: take the **last** N parent segments
+/// joined with `/`. If `hint` has fewer than N parent segments, take all
+/// available (so a root-near asset still gets a suffix; only a totally
+/// parentless hint errors).
+///
+/// Hard-fails when `hint` has zero parent segments — ambiguity surfaces
+/// at bake time rather than getting papered over with a guid suffix. The
+/// caller (`build_db`) is responsible for detecting cross-contestant
+/// suffix collisions (two hints whose last `min_parents` segments are
+/// identical) post-hoc; this helper just emits the candidate.
+///
 /// See [Name collisions](docs/asset-database.md#name-collisions) for the
 /// `^` separator rationale.
-fn disambiguate(
-    stem: &str,
-    hint: &str,
-    owner_guid: u128,
-    asset_type: AssetTypeRaw,
-    taken: &AHashMap<(String, AssetTypeRaw), u128>,
-) -> Result<String> {
+fn parent_suffix(hint: &str, stem: &str, min_parents: usize) -> Result<String> {
     let parts: Vec<&str> = Path::new(hint)
         .parent()
         .map(|p| p.iter().filter_map(|c| c.to_str()).collect::<Vec<_>>())
         .unwrap_or_default();
-
-    // Walk parent segments from nearest to root, picking the shortest
-    // suffix that doesn't collide with a different-guid owner.
-    let mut suffix = String::new();
-    for seg in parts.iter().rev() {
-        if !suffix.is_empty() {
-            suffix.insert(0, '/');
-        }
-        suffix.insert_str(0, seg);
-        let candidate = format!("{stem}^{suffix}");
-        match taken.get(&(candidate.clone(), asset_type)) {
-            None => return Ok(candidate),
-            Some(&prev) if prev == owner_guid => return Ok(candidate),
-            Some(_) => continue,
-        }
+    if parts.is_empty() {
+        anyhow::bail!(
+            "asset-db: cannot disambiguate name `{stem}` — hint `{hint}` has no \
+             parent segments. Rename one of the colliding assets in source.",
+        );
     }
-    anyhow::bail!(
-        "asset-db: cannot disambiguate name `{stem}` for guid {owner_guid:032x} \
-         (hint `{hint}`) — every parent-segment suffix is already taken by \
-         another asset. Rename one of the colliding assets in source.",
-    )
+    let take = min_parents.min(parts.len()).max(1);
+    let suffix = parts[parts.len() - take..].join("/");
+    Ok(format!("{stem}^{suffix}"))
 }
 
 #[cfg(test)]
@@ -1285,62 +1308,47 @@ mod tests {
     }
 
     #[test]
-    fn disambiguate_walks_parents() {
-        let t = AssetTypeRaw::Native(ClassId::Texture2D as u32);
-        let mut taken = AHashMap::new();
-        taken.insert(("Foo".to_string(), t), 1u128);
-        // Nearest parent suffix wins on first try.
-        let alias = disambiguate("Foo", "pkg/Editor/Foo.cs", 2, t, &taken).unwrap();
-        assert_eq!(alias, "Foo^Editor");
+    fn parent_suffix_takes_last_two_parents() {
+        // Standard case: hint has ≥ 2 parent segments; take the deepest 2,
+        // joined with `/`.
+        let alias = parent_suffix("Assets/UI/Prefabs/Button.prefab", "Button", 2).unwrap();
+        assert_eq!(alias, "Button^UI/Prefabs");
 
-        // First-level parent already taken (by a different guid, same type)
-        // → falls back to deeper path.
-        taken.insert(("Foo^Editor".to_string(), t), 3);
-        let alias = disambiguate("Foo", "pkg/Editor/Foo.cs", 2, t, &taken).unwrap();
-        assert_eq!(alias, "Foo^pkg/Editor");
+        // Deeper path → still last 2 (independent of total depth).
+        let alias = parent_suffix(
+            "Assets/20_Contents/SettingsPopup/Prefabs/Button.prefab",
+            "Button",
+            2,
+        )
+        .unwrap();
+        assert_eq!(alias, "Button^SettingsPopup/Prefabs");
     }
 
     #[test]
-    fn disambiguate_ignores_collisions_in_other_types() {
-        // A different `AssetTypeRaw` claiming the same alias does NOT
-        // contest — type-aware dedup gives each `(name, type)` its own
-        // bucket. PNG (Texture2D) and prefab (Prefab) named `Foo` both
-        // keep bare `Foo`.
-        let png = AssetTypeRaw::Native(ClassId::Texture2D as u32);
-        let prefab = AssetTypeRaw::Native(ClassId::Prefab as u32);
-        let mut taken = AHashMap::new();
-        taken.insert(("Foo".to_string(), png), 1u128);
-        // disambiguate against the prefab bucket — `Foo` is free here.
-        let alias = disambiguate("Foo", "Assets/Bar/Foo.prefab", 2, prefab, &taken).unwrap();
-        // Walk produces `Foo^Bar` because we always step at least one
-        // parent (disambiguate's contract is "produce a suffixed form");
-        // the contention check upstream is what decides whether to call.
-        assert_eq!(alias, "Foo^Bar");
+    fn parent_suffix_pads_when_fewer_parents_than_requested() {
+        // `Assets/Foo.prefab` has exactly one parent segment (`Assets`).
+        // The rule is "take last min_parents OR all available, whichever
+        // is smaller" — never errors when at least one parent exists.
+        let alias = parent_suffix("Assets/Foo.prefab", "Foo", 2).unwrap();
+        assert_eq!(alias, "Foo^Assets");
     }
 
     #[test]
-    fn disambiguate_returns_existing_when_same_owner() {
-        // When the candidate suffix is already mapped to `owner_guid`, the
-        // sub-asset can safely share that alias — its lookup path resolves
-        // back to the same guid, so no real ambiguity exists.
-        let t = AssetTypeRaw::Native(ClassId::Texture2D as u32);
-        let mut taken = AHashMap::new();
-        taken.insert(("Cloud1".to_string(), t), 0xa0_u128);
-        taken.insert(("Cloud1^Tower".to_string(), t), 0xb0_u128);
-        let alias =
-            disambiguate("Cloud1", "Assets/Tower/Cloud1.png", 0xb0_u128, t, &taken).unwrap();
-        assert_eq!(alias, "Cloud1^Tower");
+    fn parent_suffix_is_pure_function_of_hint() {
+        // No `taken`, no `owner_guid`, no order dependence — same hint
+        // always yields the same suffix. The whole point of the rewrite.
+        let a = parent_suffix("Assets/A/B/Foo.prefab", "Foo", 2).unwrap();
+        let b = parent_suffix("Assets/A/B/Foo.prefab", "Foo", 2).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, "Foo^A/B");
     }
 
     #[test]
-    fn disambiguate_hard_fails_when_no_parent_segments() {
-        let t = AssetTypeRaw::Native(ClassId::Texture2D as u32);
-        let mut taken = AHashMap::new();
-        taken.insert(("Foo".to_string(), t), 1u128);
-        // Hint has no directories — nothing to suffix with. Must error
+    fn parent_suffix_hard_fails_when_no_parent_segments() {
+        // Hint is a bare filename — nothing to suffix with. Must error
         // rather than silently fall back to a guid suffix.
         let err =
-            disambiguate("Foo", "Foo.cs", 2u128, t, &taken).expect_err("must hard-fail");
+            parent_suffix("Foo.cs", "Foo", 2).expect_err("must hard-fail with no parents");
         let msg = format!("{err:#}");
         assert!(msg.contains("disambiguate"), "msg: {msg}");
         assert!(msg.contains("Foo"), "msg: {msg}");
@@ -1362,8 +1370,9 @@ mod tests {
 
     /// Pin: when a name is claimed by ≥2 distinct guids of the same
     /// `asset_type`, every claimant must rename — no "first wins" carve-out.
-    /// The deduped form is consistent across claimants: each entry resolves
-    /// through `disambiguate` against its own hint.
+    /// Each entry's alias is `stem^<last 2 parents of hint>`, derived
+    /// purely from its own hint (independent of iteration order or which
+    /// siblings exist).
     ///
     /// Two same-type Texture2D `Cloud1.png` files in different folders
     /// share the bare alias `Cloud1` until type-aware dedup forces both to
@@ -1392,21 +1401,11 @@ mod tests {
         let a_entry = db.find_by_guid(png_a_guid).unwrap();
         let b_entry = db.find_by_guid(png_b_guid).unwrap();
 
-        // Neither entry keeps the bare alias — both renamed.
-        assert_ne!(&*a_entry.name, "Cloud1");
-        assert_ne!(&*b_entry.name, "Cloud1");
-        assert!(
-            a_entry.name.starts_with("Cloud1^"),
-            "first png top-level not deduped: {}",
-            a_entry.name,
-        );
-        assert!(
-            b_entry.name.starts_with("Cloud1^"),
-            "second png top-level not deduped: {}",
-            b_entry.name,
-        );
-        // Distinct hints → distinct deduped suffixes.
-        assert_ne!(&*a_entry.name, &*b_entry.name);
+        // Deterministic depth-2 suffix from each entry's own hint. Each
+        // hint has 2 parents (`Assets/Other`, `Assets/Tower`); depth-2
+        // takes both.
+        assert_eq!(&*a_entry.name, "Cloud1^Assets/Other");
+        assert_eq!(&*b_entry.name, "Cloud1^Assets/Tower");
 
         // Sub-asset dedup: the Sprite sub-asset's `Cloud1` lives in its own
         // type-bucket (Sprite, not Texture2D), so it isn't contested by the
@@ -1417,6 +1416,72 @@ mod tests {
         assert_eq!(
             &*png_b_sub.name, "Cloud1",
             "Sprite sub-asset should stay bare under type-aware dedup",
+        );
+    }
+
+    /// Pin the stability win: a contested entry's alias is a pure function
+    /// of its own hint. Adding an unrelated third claimant to the same
+    /// `(name, asset_type)` bucket does NOT shift the first two's aliases —
+    /// each one is computed independently from its own depth-2 suffix.
+    ///
+    /// Pre-rewrite the order-dependent shortest-suffix rule made this fail:
+    /// the new claimant could displace whichever sibling currently held
+    /// the shorter form.
+    #[test]
+    fn build_db_contested_alias_is_independent_of_other_siblings() {
+        let a_guid = 0xa0_u128;
+        let b_guid = 0xb0_u128;
+        let c_guid = 0xc0_u128;
+
+        // Two-claimant bake.
+        let raw_two = vec![
+            raw_native("Assets/X/Y/Foo.prefab", a_guid, vec![]),
+            raw_native("Assets/P/Q/Foo.prefab", b_guid, vec![]),
+        ];
+        let db_two = build_db(raw_two, None, None, false).unwrap();
+        let a_name_two = db_two.find_by_guid(a_guid).unwrap().name.clone();
+        let b_name_two = db_two.find_by_guid(b_guid).unwrap().name.clone();
+
+        // Three-claimant bake — add an unrelated `Foo.prefab` deeper in
+        // the tree. Under the old order-dependent rule it could rotate
+        // which of {a, b} kept the shorter suffix.
+        let raw_three = vec![
+            raw_native("Assets/X/Y/Foo.prefab", a_guid, vec![]),
+            raw_native("Assets/P/Q/Foo.prefab", b_guid, vec![]),
+            raw_native("Assets/M/N/Foo.prefab", c_guid, vec![]),
+        ];
+        let db_three = build_db(raw_three, None, None, false).unwrap();
+        let a_name_three = db_three.find_by_guid(a_guid).unwrap().name.clone();
+        let b_name_three = db_three.find_by_guid(b_guid).unwrap().name.clone();
+
+        // Aliases for the original two are byte-identical across both bakes.
+        assert_eq!(&*a_name_two, &*a_name_three);
+        assert_eq!(&*b_name_two, &*b_name_three);
+        assert_eq!(&*a_name_two, "Foo^X/Y");
+        assert_eq!(&*b_name_two, "Foo^P/Q");
+    }
+
+    /// Pin: two contestants whose hints share the same depth-2 parent path
+    /// produce identical aliases under the pure-suffix rule. The bake must
+    /// hard-fail rather than fall back to a deeper suffix or pick a winner.
+    /// Error message names BOTH hints + the asset type so the user can
+    /// rename one in source.
+    #[test]
+    fn build_db_fails_when_two_contestants_share_depth_2_parent() {
+        let a_guid = 0xa0_u128;
+        let b_guid = 0xb0_u128;
+        // Both hints end with `…/X/Y/Foo.png` — depth-2 suffix `X/Y` for both.
+        let raw = vec![
+            raw_native("Assets/X/Y/Foo.png", a_guid, vec![]),
+            raw_native("Outer/X/Y/Foo.png", b_guid, vec![]),
+        ];
+        let err = build_db(raw, None, None, false)
+            .expect_err("identical depth-2 suffix must hard-fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Foo"), "msg should name the stem: {msg}");
+        assert!(
+            msg.contains("Assets/X/Y/Foo.png") && msg.contains("Outer/X/Y/Foo.png"),
+            "msg should name both hints: {msg}",
         );
     }
 
@@ -1669,21 +1734,21 @@ mod tests {
         assert_eq!(&*entry.sub_assets[0].name, "Lone");
     }
 
-    /// Pin: when a top-level alias is genuinely unresolvable (no parent
-    /// segments left to walk and the bare stem is already taken), the
-    /// bake hard-fails rather than silently falling back to a `^<guid8>`
-    /// suffix. Per the project policy: ambiguity surfaces at bake time,
-    /// not encode time.
+    /// Pin: when a top-level alias is genuinely unresolvable (contested
+    /// entries with no parent segments to suffix with), the bake hard-fails
+    /// rather than silently falling back to a `^<guid8>` suffix. Per the
+    /// project policy: ambiguity surfaces at bake time, not encode time.
     #[test]
     fn build_db_fails_when_dedup_cannot_resolve() {
         let raw = vec![
             // Two top-level entries with the same bare stem and no parent
-            // segments to walk — `disambiguate` has nothing to suffix with.
+            // segments to walk — `parent_suffix` has nothing to attach.
             raw_native("Foo.asset", 0x01_u128, vec![]),
             raw_native("Foo.prefab", 0x02_u128, vec![]),
         ];
 
-        let err = build_db(raw, None, None, false).expect_err("collision with no parent dirs must hard-fail");
+        let err = build_db(raw, None, None, false)
+            .expect_err("collision with no parent dirs must hard-fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Foo") && msg.contains("disambiguate"),
