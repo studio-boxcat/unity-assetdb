@@ -46,7 +46,7 @@ unity-assetdb guid  <path|pattern>             # exact hint → 1 row; else subs
 unity-assetdb path  <guid>                     # → project-rel hint
 unity-assetdb find  <pattern>                  # case-insensitive substring on names
 unity-assetdb list  [--type <kind>]            # all entries, optional ClassId or Script:<32hex>
-unity-assetdb alias <name> [--scrub-chars <c>] # exact-match (auto-scrubs input)
+unity-assetdb alias <name> [--scrub-chars <c>] # exact-match (auto-scrubs input). Names are `<stem>.<ext>` — see [[asset-database.md#name-collisions]].
 unity-assetdb usage <guid|path>                # path\tline\ttext for every YAML file referencing the GUID
 
 # Register a new asset without booting Unity. Synthesizes a minimal .meta

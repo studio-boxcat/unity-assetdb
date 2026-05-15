@@ -159,8 +159,6 @@ pub struct ParsedEntry {
     pub guid: u128,
     pub asset_type: ParsedAssetType,
     pub hint: String,
-    /// Raw filename stem — no dedup, no sanitizer applied.
-    pub name: String,
     pub meta_mtime_ns: u64,
     pub asset_mtime_ns: u64,
     pub sub_assets: Vec<SubAsset>,
@@ -603,7 +601,6 @@ fn raw_to_parsed(r: RawEntry) -> ParsedEntry {
             AssetTypeRaw::Script(g) => ParsedAssetType::Script(g),
         },
         hint: r.hint,
-        name: r.name,
         meta_mtime_ns: r.meta_mtime_ns,
         asset_mtime_ns: r.asset_mtime_ns,
         sub_assets: r.sub_assets,
@@ -841,14 +838,14 @@ fn build_db(
     // Stable order: sort by hint so dedup picks the same "winner" each bake.
     raw.sort_by(|a, b| a.hint.cmp(&b.hint));
 
-    // Reset every entry's name to its raw filename stem before dedup
+    // Reset every entry's name to its raw `<stem>.<ext>` before dedup
     // (cached entries arrive with their previously-suffixed name; if we
     // dedup against that, collisions compound across bakes), then sanitize
     // ref-reserved chars in both top-level and sub-asset names — covers the
     // three name sources (filename stem, YAML m_Name sub-assets, `.meta`
     // sprite-sheet entries) in one pass before dedup uses `r.name` as key.
     for r in raw.iter_mut() {
-        r.name = filename_stem_from_hint(&r.hint);
+        r.name = filename_with_ext_from_hint(&r.hint);
         if let Some(san) = sanitizer
             && let Some(clean) = san(&r.name)
         {
@@ -1078,12 +1075,17 @@ fn filename_stem(p: &Path) -> String {
         .to_string()
 }
 
-fn filename_stem_from_hint(hint: &str) -> String {
-    Path::new(hint)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string()
+/// `<stem>.<ext>` for a project-rel hint, or bare `<stem>` if no
+/// extension. Canonical top-level alias shape — see
+/// `docs/asset-database.md#name-collisions`. Public so `register` can
+/// mint names matching the next full bake.
+pub fn filename_with_ext_from_hint(hint: &str) -> String {
+    let p = Path::new(hint);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    match p.extension().and_then(|s| s.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("{stem}.{ext}"),
+        _ => stem.to_string(),
+    }
 }
 
 /// Depth of the parent-suffix the dedup pass uses when an alias is
@@ -1358,7 +1360,8 @@ mod tests {
     #[test]
     fn stem_basic() {
         assert_eq!(filename_stem(Path::new("foo/Bar.prefab")), "Bar");
-        assert_eq!(filename_stem_from_hint("foo/Bar.prefab"), "Bar");
+        assert_eq!(filename_with_ext_from_hint("foo/Bar.prefab"), "Bar.prefab");
+        assert_eq!(filename_with_ext_from_hint("foo/Bar"), "Bar");
     }
 
     #[test]
@@ -1468,21 +1471,20 @@ mod tests {
         let a_entry = db.find_by_guid(png_a_guid).unwrap();
         let b_entry = db.find_by_guid(png_b_guid).unwrap();
 
-        // Deterministic depth-2 suffix from each entry's own hint. Each
-        // hint has 2 parents (`Assets/Other`, `Assets/Tower`); depth-2
-        // takes both.
-        assert_eq!(&*a_entry.name, "Cloud1^Assets/Other");
-        assert_eq!(&*b_entry.name, "Cloud1^Assets/Tower");
+        // Always-ext top-level name (`Cloud1.png`) plus deterministic
+        // depth-2 suffix from each entry's own hint. Each hint has 2
+        // parents (`Assets/Other`, `Assets/Tower`); depth-2 takes both.
+        assert_eq!(&*a_entry.name, "Cloud1.png^Assets/Other");
+        assert_eq!(&*b_entry.name, "Cloud1.png^Assets/Tower");
 
         // Sub-asset dedup: the Sprite sub-asset's `Cloud1` lives in its own
-        // type-bucket (Sprite, not Texture2D), so it isn't contested by the
-        // Texture2D collision above. It stays bare. The png_b entry is the
-        // only Sprite-bucket owner.
+        // type-bucket (Sprite, not Texture2D) and never grows an ext suffix
+        // — sub-assets carry no file extension of their own. It stays bare.
         let png_b_sub = &b_entry.sub_assets[0];
         assert_eq!(png_b_sub.file_id, sprite_fid);
         assert_eq!(
             &*png_b_sub.name, "Cloud1",
-            "Sprite sub-asset should stay bare under type-aware dedup",
+            "Sprite sub-asset stays bare; ext suffix is a top-level-only marker",
         );
     }
 
@@ -1524,8 +1526,8 @@ mod tests {
         // Aliases for the original two are byte-identical across both bakes.
         assert_eq!(&*a_name_two, &*a_name_three);
         assert_eq!(&*b_name_two, &*b_name_three);
-        assert_eq!(&*a_name_two, "Foo^X/Y");
-        assert_eq!(&*b_name_two, "Foo^P/Q");
+        assert_eq!(&*a_name_two, "Foo.prefab^X/Y");
+        assert_eq!(&*b_name_two, "Foo.prefab^P/Q");
     }
 
     /// Pin: contested `.cs` MonoScripts use a GUID-prefix suffix instead of
@@ -1559,8 +1561,8 @@ mod tests {
             },
         ];
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
-        assert_eq!(&*db.find_by_guid(a_guid).unwrap().name, "L^9ddf5ad8");
-        assert_eq!(&*db.find_by_guid(b_guid).unwrap().name, "L^3751098b");
+        assert_eq!(&*db.find_by_guid(a_guid).unwrap().name, "L.cs^9ddf5ad8");
+        assert_eq!(&*db.find_by_guid(b_guid).unwrap().name, "L.cs^3751098b");
     }
 
     /// Pin: two contestants whose hints share the same depth-2 parent path
@@ -1587,9 +1589,11 @@ mod tests {
         );
     }
 
-    /// Pin type-aware dedup: a Texture2D and a Prefab sharing the stem
-    /// `Foo` both keep the bare alias. Reverse lookup discriminates by
-    /// the field's declared C# type at the consumer layer.
+    /// Pin always-ext: a Texture2D and a Prefab sharing the stem `Foo`
+    /// land in distinct buckets under the `<stem>.<ext>` naming rule
+    /// (`Foo.png` vs `Foo.prefab`) — neither contests, both uncontested-
+    /// bare-alias-with-ext. Consumer no longer needs to discriminate by
+    /// C# field type to disambiguate cross-kind same-stem cases.
     #[test]
     fn build_db_keeps_bare_alias_for_type_distinct_collisions() {
         let png_guid = 0xa0_u128;
@@ -1615,9 +1619,10 @@ mod tests {
             },
         ];
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
-        // Both keep bare `Foo` because they live in distinct type buckets.
-        assert_eq!(&*db.find_by_guid(png_guid).unwrap().name, "Foo");
-        assert_eq!(&*db.find_by_guid(prefab_guid).unwrap().name, "Foo");
+        // Each entry's alias is `<stem>.<ext>`; distinct exts → distinct
+        // buckets → both uncontested.
+        assert_eq!(&*db.find_by_guid(png_guid).unwrap().name, "Foo.png");
+        assert_eq!(&*db.find_by_guid(prefab_guid).unwrap().name, "Foo.prefab");
     }
 
     /// Pin: AnimatorController-embedded sub-assets are excluded from the
@@ -1662,9 +1667,13 @@ mod tests {
             },
         ];
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
-        // Standalone keeps bare `Idle`.
-        assert_eq!(&*db.find_by_guid(other_state_guid).unwrap().name, "Idle");
-        // Embedded state stays as authored in the parent's namespace.
+        // Standalone gets `Idle.asset` under the always-ext rule.
+        assert_eq!(
+            &*db.find_by_guid(other_state_guid).unwrap().name,
+            "Idle.asset",
+        );
+        // Embedded state stays as authored in the parent's namespace —
+        // sub-assets don't carry an ext (no own file on disk).
         let ctrl_entry = db.find_by_guid(controller_guid).unwrap();
         assert_eq!(&*ctrl_entry.sub_assets[0].name, "Idle");
     }
@@ -1704,7 +1713,10 @@ mod tests {
             },
         ];
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
-        assert_eq!(&*db.find_by_guid(other_group_guid).unwrap().name, "Master");
+        assert_eq!(
+            &*db.find_by_guid(other_group_guid).unwrap().name,
+            "Master.asset",
+        );
         let mixer_entry = db.find_by_guid(mixer_guid).unwrap();
         assert_eq!(&*mixer_entry.sub_assets[0].name, "Master");
     }
@@ -1801,14 +1813,15 @@ mod tests {
             },
         ];
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
-        // Standalone .anim keeps bare `Animation` — the prefab-embedded
-        // `Animation` doesn't claim the global alias.
+        // Standalone .anim gets `Animation.anim` — the prefab-embedded
+        // `Animation` sub-asset is excluded from the global pool and
+        // never contests.
         assert_eq!(
             &*db.find_by_guid(other_clip_guid).unwrap().name,
-            "Animation"
+            "Animation.anim",
         );
         // Prefab-embedded sub-asset keeps its raw name (lives in parent's
-        // namespace; `$Animation@PatternBG` at the consumer layer).
+        // namespace; `$Animation@PatternBG.prefab` at the consumer layer).
         let prefab_entry = db.find_by_guid(prefab_guid).unwrap();
         assert_eq!(&*prefab_entry.sub_assets[0].name, "Animation");
     }
@@ -1832,21 +1845,178 @@ mod tests {
 
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
         let entry = db.find_by_guid(png_guid).unwrap();
-        assert_eq!(&*entry.name, "Lone");
+        // Top-level carries the always-ext suffix; the same-name Sprite
+        // sub-asset stays bare (sub-assets have no file extension).
+        assert_eq!(&*entry.name, "Lone.png");
         assert_eq!(&*entry.sub_assets[0].name, "Lone");
     }
 
+    /// Pin: extensionless hints fall back to a bare-stem alias — no
+    /// trailing-dot artifact. Rare in practice (Unity assets almost
+    /// always have an extension) but the bake must not corrupt the
+    /// alias for the degenerate case.
+    #[test]
+    fn build_db_keeps_bare_alias_for_extensionless_hint() {
+        let guid = 0x77_u128;
+        let raw = vec![RawEntry {
+            guid,
+            asset_type_raw: AssetTypeRaw::Native(ClassId::DefaultAsset as u32),
+            hint: "Assets/Misc/README".to_string(),
+            name: String::new(),
+            meta_mtime_ns: 0,
+            asset_mtime_ns: 0,
+            sub_assets: vec![],
+        }];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        assert_eq!(&*db.find_by_guid(guid).unwrap().name, "README");
+    }
+
+    /// Pin the always-ext contract: every top-level alias carries the
+    /// asset's file extension. `Foo.prefab` → `Foo.prefab`, not bare `Foo`.
+    /// Disambiguates consumer-side lookups when a stem is reused across
+    /// asset kinds without forcing the consumer to discriminate by C#
+    /// field type.
+    #[test]
+    fn build_db_always_appends_ext_to_alias() {
+        let prefab_guid = 0x10_u128;
+        let raw = vec![RawEntry {
+            guid: prefab_guid,
+            asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
+            hint: "Assets/UI/Foo.prefab".to_string(),
+            name: String::new(),
+            meta_mtime_ns: 0,
+            asset_mtime_ns: 0,
+            sub_assets: vec![],
+        }];
+
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        assert_eq!(&*db.find_by_guid(prefab_guid).unwrap().name, "Foo.prefab");
+    }
+
+    /// Pin the BoxKeyObtainLongtake real-world case: a stem reused across
+    /// `.unity`, `.playable`, `.cs`, `.prefab` resolves to 4 distinct
+    /// aliases via the `.ext` suffix — no `^path` needed because each ext
+    /// is unique within its own bucket.
+    #[test]
+    fn build_db_disambiguates_cross_ext_collision_via_ext_suffix() {
+        let scene_guid = 0x01_u128;
+        let playable_guid = 0x02_u128;
+        let script_guid = 0x03_u128;
+        let prefab_guid = 0x04_u128;
+        let timeline_script_guid = 0xaaaa_u128;
+
+        let raw = vec![
+            RawEntry {
+                guid: scene_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::SceneAsset as u32),
+                hint: "Assets/Sandbox/BoxKeyObtainLongtake.unity".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+            RawEntry {
+                guid: playable_guid,
+                asset_type_raw: AssetTypeRaw::Script(timeline_script_guid),
+                hint: "Assets/Prefabs/BoxKeyObtainLongtake.playable".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+            RawEntry {
+                guid: script_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::MonoScript as u32),
+                hint: "Assets/Scripts/BoxKeyObtainLongtake.cs".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+            RawEntry {
+                guid: prefab_guid,
+                asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
+                hint: "Assets/Prefabs/BoxKeyObtainLongtake.prefab".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        assert_eq!(
+            &*db.find_by_guid(scene_guid).unwrap().name,
+            "BoxKeyObtainLongtake.unity",
+        );
+        assert_eq!(
+            &*db.find_by_guid(playable_guid).unwrap().name,
+            "BoxKeyObtainLongtake.playable",
+        );
+        assert_eq!(
+            &*db.find_by_guid(script_guid).unwrap().name,
+            "BoxKeyObtainLongtake.cs",
+        );
+        assert_eq!(
+            &*db.find_by_guid(prefab_guid).unwrap().name,
+            "BoxKeyObtainLongtake.prefab",
+        );
+    }
+
+    /// Pin the OrgelActivityTimeline shape: two Script-typed entries
+    /// (`.asset` SO installer + `.playable` TimelineAsset) — both
+    /// MonoBehaviour-114, distinct script GUIDs — resolve via their
+    /// extensions alone, no within-ext contention.
+    #[test]
+    fn build_db_disambiguates_script_typed_cross_ext_via_ext_suffix() {
+        let asset_guid = 0xc7_u128;
+        let playable_guid = 0xed_u128;
+        let installer_script = 0x1111_u128;
+        let timeline_script = 0x2222_u128;
+        let raw = vec![
+            RawEntry {
+                guid: asset_guid,
+                asset_type_raw: AssetTypeRaw::Script(installer_script),
+                hint: "Assets/OrgelEvent/OrgelActivityTimeline.asset".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+            RawEntry {
+                guid: playable_guid,
+                asset_type_raw: AssetTypeRaw::Script(timeline_script),
+                hint: "Assets/OrgelEvent/OrgelActivityTimeline.playable".to_string(),
+                name: String::new(),
+                meta_mtime_ns: 0,
+                asset_mtime_ns: 0,
+                sub_assets: vec![],
+            },
+        ];
+        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        assert_eq!(
+            &*db.find_by_guid(asset_guid).unwrap().name,
+            "OrgelActivityTimeline.asset",
+        );
+        assert_eq!(
+            &*db.find_by_guid(playable_guid).unwrap().name,
+            "OrgelActivityTimeline.playable",
+        );
+    }
+
     /// Pin: when a top-level alias is genuinely unresolvable (contested
-    /// entries with no parent segments to suffix with), the bake hard-fails
-    /// rather than silently falling back to a `^<guid8>` suffix. Per the
-    /// project policy: ambiguity surfaces at bake time, not encode time.
+    /// same-ext entries with no parent segments to suffix with), the bake
+    /// hard-fails rather than silently falling back to a `^<guid8>` suffix.
+    /// Per the project policy: ambiguity surfaces at bake time, not encode
+    /// time. (Distinct exts on the same stem fall into distinct buckets
+    /// under the always-ext rule and never reach `parent_suffix`.)
     #[test]
     fn build_db_fails_when_dedup_cannot_resolve() {
         let raw = vec![
-            // Two top-level entries with the same bare stem and no parent
-            // segments to walk — `parent_suffix` has nothing to attach.
-            raw_native("Foo.asset", 0x01_u128, vec![]),
-            raw_native("Foo.prefab", 0x02_u128, vec![]),
+            // Two top-level entries with the same `<stem>.<ext>` name and
+            // no parent segments to walk — `parent_suffix` has nothing to
+            // attach.
+            raw_native("Foo.png", 0x01_u128, vec![]),
+            raw_native("Foo.png", 0x02_u128, vec![]),
         ];
 
         let err = build_db(raw, None, None, false)

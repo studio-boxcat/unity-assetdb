@@ -127,7 +127,7 @@ fn bake_then_load_roundtrip() {
     let foo = db
         .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
         .expect("Foo.prefab missing");
-    assert_eq!(&*foo.name, "Foo");
+    assert_eq!(&*foo.name, "Foo.prefab");
     match foo.asset_type {
         store::AssetType::Native(n) => {
             assert_eq!(n, unity_assetdb::class_id::ClassId::Prefab as u32);
@@ -141,7 +141,7 @@ fn bake_then_load_roundtrip() {
     let bar = db
         .find_by_guid(0xcccc3333cccc3333cccc3333cccc3333_u128)
         .expect("Bar.asset missing");
-    assert_eq!(&*bar.name, "Bar");
+    assert_eq!(&*bar.name, "Bar.asset");
     match bar.asset_type {
         store::AssetType::Script(idx) => {
             assert_eq!(db.script_guid(idx), 0xbbbb2222bbbb2222bbbb2222bbbb2222_u128);
@@ -155,7 +155,7 @@ fn bake_then_load_roundtrip() {
     let sheet = db
         .find_by_guid(0xdddd4444dddd4444dddd4444dddd4444_u128)
         .expect("Sheet.png missing");
-    assert_eq!(&*sheet.name, "Sheet");
+    assert_eq!(&*sheet.name, "Sheet.png");
     match sheet.asset_type {
         store::AssetType::Native(n) => {
             assert_eq!(n, unity_assetdb::class_id::ClassId::Texture2D as u32);
@@ -418,7 +418,7 @@ TextureImporter:
         .find_by_guid(0xeeee5555eeee5555eeee5555eeee5555_u128)
         .expect("Icon.png missing from db");
 
-    assert_eq!(&*entry.name, "Icon");
+    assert_eq!(&*entry.name, "Icon.png");
     assert_eq!(
         entry.sub_assets.len(),
         1,
@@ -428,6 +428,8 @@ TextureImporter:
         entry.sub_assets[0].file_id,
         ClassId::Sprite.canonical_subobject_fid()
     );
+    // Sub-asset name carries no ext suffix — synthesized from filename
+    // stem alone.
     assert_eq!(&*entry.sub_assets[0].name, "Icon");
 
     fs::remove_dir_all(&root).ok();
@@ -474,7 +476,10 @@ DefaultImporter:
     let entry = db
         .find_by_guid(0xc01ef0000864f41bdaacaf9939e97b36_u128)
         .expect("DefaultImporter-imported asset missing from db");
-    assert_eq!(&*entry.name, "Cat.fla");
+    // Always-ext rule: stem `Cat.fla` (Rust's `file_stem` strips only
+    // the trailing `.swf`) plus the actual file extension `.swf` →
+    // `Cat.fla.swf`. Mirrors the on-disk filename.
+    assert_eq!(&*entry.name, "Cat.fla.swf");
     match entry.asset_type {
         store::AssetType::Native(n) => {
             assert_eq!(

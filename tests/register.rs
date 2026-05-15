@@ -96,7 +96,7 @@ fn register_new_asset_synthesizes_meta_and_inserts_db() {
     // DB has the entry.
     let db = store::read(&store::db_path(&out_dir)).unwrap();
     let entry = db.find_by_guid(outcome.guid).expect("entry in db");
-    assert_eq!(&*entry.name, "MyTween");
+    assert_eq!(&*entry.name, "MyTween.asset");
     assert_eq!(&*entry.hint, "Assets/Tween/MyTween.asset");
     // Script type → interned.
     match entry.asset_type {
@@ -205,7 +205,7 @@ fn register_applies_scrub_chars_to_entry_name() {
 
     let db = store::read(&store::db_path(&out_dir)).unwrap();
     let entry = db.find_by_guid(outcome.guid).unwrap();
-    assert_eq!(&*entry.name, "sample_v1");
+    assert_eq!(&*entry.name, "sample_v1.asset");
 }
 
 #[test]

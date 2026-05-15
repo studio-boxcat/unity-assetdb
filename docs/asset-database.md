@@ -45,13 +45,13 @@ Each `AssetEntry`:
 |-------|------|-------|
 | `guid` | `u128` | 32-hex Unity GUID. |
 | `asset_type` | `AssetType` | Tagged enum — `Native(class_id)` or `Script(script_idx)`. See [Asset typing](#asset-typing). |
-| `name` | `Box<str>` | Filename stem (with optional collision suffix). See [Name collisions](#name-collisions). |
-| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Sub-asset rows (sprite-sheet entries, sub-clips, plus the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures — fileID `21300000` = `ClassId::Sprite × 100_000`, name = filename stem; synthesized at bake since `.meta` omits it). `class_id` stored explicitly so prefab-embedded sub-asset rows (whose hashed fileIDs would otherwise collapse via the `file_id / 100_000` heuristic) retain their real Unity class. Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
+| `name` | `Box<str>` | `<stem>.<ext>` derived from `hint` on every bake, with optional collision suffix appended. See [Name collisions](#name-collisions). |
+| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Sub-asset rows (sprite-sheet entries, sub-clips, plus the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures — fileID `21300000` = `ClassId::Sprite × 100_000`, name = bare filename stem (sub-assets carry no ext); synthesized at bake since `.meta` omits it). `class_id` stored explicitly so prefab-embedded sub-asset rows (whose hashed fileIDs would otherwise collapse via the `file_id / 100_000` heuristic) retain their real Unity class. Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
 | `hint` | `Box<str>` | Project-root-relative path (`Assets/Foo.prefab`, `Packages/com.boxcat.libs/Bar.mixer`). Lets downstream consumers locate assets by guid without re-walking the project tree. |
 
 `Box<str>` instead of `String` saves 8 bytes per string (no growable-capacity field) once decoded.
 
-**`asset-db.cache.bin`** — bake-only side file. Same magic-prefixed bincode envelope. Each entry: `(hint, meta_mtime_ns, asset_mtime_ns, guid, asset_type, sub_assets)`. Hint here is the cache lookup key; everything else lets a re-bake reconstruct the entry without re-parsing the .meta + asset. `name` is **not** cached — it's re-derived from the hint's filename stem and re-applied to the [Name collisions](#name-collisions) rule on every bake, so the bare ↔ suffix promote/demote stays current as siblings come and go.
+**`asset-db.cache.bin`** — bake-only side file. Same magic-prefixed bincode envelope. Each entry: `(hint, meta_mtime_ns, asset_mtime_ns, guid, asset_type, sub_assets)`. Hint here is the cache lookup key; everything else lets a re-bake reconstruct the entry without re-parsing the .meta + asset. `name` is **not** cached — it's re-derived as `<stem>.<ext>` from the hint and re-applied to the [Name collisions](#name-collisions) rule on every bake, so the within-ext bare ↔ `^path` promote/demote stays current as siblings come and go.
 
 ### Asset typing
 
@@ -173,51 +173,63 @@ through the optional callbacks. Pass `None` to discard.
 
 ### Name collisions
 
-Filename stems aren't unique across a project (e.g. multiple
-`Dependencies.asmdef`). The bake's dedup pass operates on a name pool
-keyed by `(name, asset_type)` — same-name claims of distinct `asset_type`
-(`Foo.png` Texture2D vs. `Foo.prefab` Prefab) DON'T contest because
-consumers can discriminate at the lookup layer using the field's declared
-C# type.
+**Always-ext aliases.** Every top-level entry's `name` is
+`<stem>.<ext>` — the bake derives it directly from the hint on every
+run. `Foo.prefab` aliases as `Foo.prefab`, not bare `Foo`. Cross-kind
+same-stem collisions
+(`BoxKeyObtainLongtake.unity` + `.playable` + `.cs` + `.prefab`,
+or `OrgelActivityTimeline.asset` + `.playable`) resolve at the bake
+layer via the ext suffix alone, so consumers can drop their
+C#-field-type discriminators for the type-distinct cases that used to
+need them. Files with no extension (rare — e.g. extensionless binary
+blobs) keep a bare-stem alias.
+
+The bake's dedup pass operates on a name pool keyed by
+`(name, asset_type)`. Since `name` always carries the extension,
+distinct-ext same-stem entries automatically fall into distinct
+buckets and never contest. Within a single bucket (same `<stem>.<ext>`,
+same `asset_type`, distinct guids) the within-ext disambiguation rules
+below apply.
 
 **Sub-asset namespacing:** sprite-sheet style sub-assets (Sprite
-sub-objects on a `.spriteatlas` or texture) join the global pool — they're
-addressable as bare names. Prefab-embedded sub-assets (legacy
-`AnimationClip` doc inline in a `.prefab`, AnimatorState in a
+sub-objects on a `.spriteatlas` or texture) join the global pool. Their
+names stay bare — sub-assets have no file extension of their own — and
+consumers address them as `$<sub>@<parent_alias>`, which now naturally
+carries the parent's ext (`$Foo@Bar.prefab`). Prefab-embedded sub-assets
+(legacy `AnimationClip` doc inline in a `.prefab`, AnimatorState in a
 `.controller`, AudioMixerGroup in a `.mixer`, Timeline tracks in a
-`.playable`) are EXCLUDED from the global pool; they live in their parent
-prefab's namespace and consumers resolve them through a parent-scoped
-addressing scheme.
+`.playable`) are EXCLUDED from the global pool entirely; they live in
+their parent's namespace and resolve through the same `$…@…` scheme.
 
-**No-winner rule:** when ≥ 2 distinct guids claim the same `(name,
-asset_type)` pair, **every** claimant gets renamed. Nobody keeps the bare
-alias. Single-owner names within a `(name, asset_type)` bucket stay bare.
+**No-winner rule:** when ≥ 2 distinct guids claim the same
+`(name, asset_type)` pair (same stem + same ext + same type), **every**
+claimant gets renamed via the depth-2 path suffix below.
 
 **Depth-2 suffix rule (default):** each contested entry's alias is
-`stem^<last-2-parent-dirs-of-hint>`, joined with `/`. The suffix is a pure
-function of the entry's own hint — no `taken`-map consultation, no
-order-dependence:
+`<stem>.<ext>^<last-2-parent-dirs-of-hint>`, joined with `/`. The
+suffix is a pure function of the entry's own hint — no `taken`-map
+consultation, no order-dependence:
 
 | Hint | Alias |
 |------|-------|
-| `Assets/10_UIElements/04_Prefabs/Button.prefab` | `Button^10_UIElements/04_Prefabs` |
-| `Assets/20_Contents/SettingsPopup/Prefabs/Button.prefab` | `Button^SettingsPopup/Prefabs` |
-| `Assets/20_Contents/WaitForUpdatesPopup/Prefabs/Button.prefab` | `Button^WaitForUpdatesPopup/Prefabs` |
+| `Assets/10_UIElements/04_Prefabs/Button.prefab` | `Button.prefab^10_UIElements/04_Prefabs` |
+| `Assets/20_Contents/SettingsPopup/Prefabs/Button.prefab` | `Button.prefab^SettingsPopup/Prefabs` |
+| `Assets/20_Contents/WaitForUpdatesPopup/Prefabs/Button.prefab` | `Button.prefab^WaitForUpdatesPopup/Prefabs` |
 
 Hints with fewer than 2 parent segments take whatever's available
-(`Assets/Foo.prefab` → `Foo^Assets`). Hints with zero parent segments
-hard-fail — no suffix possible.
+(`Assets/Foo.prefab` → `Foo.prefab^Assets`). Hints with zero parent
+segments hard-fail — no suffix possible.
 
 **GUID-suffix rule for `.cs` MonoScripts:** contested `Native(MonoScript)`
-entries use `stem^<first-8-hex-of-guid>` instead of the path-based rule
-(`L^9ddf5ad8`, `L^3751098b`, …). MonoScript filenames are conventional
-Unity classnames whose downstream lookups go through GUIDs regardless,
-and mirror-package vendoring (UniTask vs. Zenject both shipping a
-`Runtime/Utils/L.cs`) makes the path-based depth-2 alias structurally
-ambiguous. The GUID suffix is intrinsic to the asset — survives `git mv`
-and is independent of sibling churn. 8 hex chars = ~0.01% birthday-
-collision odds at N=1000; on the rare collision the bake still
-hard-fails and the user can regenerate one of the GUIDs.
+entries use `<stem>.cs^<first-8-hex-of-guid>` instead of the path-based
+rule (`L.cs^9ddf5ad8`, `L.cs^3751098b`, …). MonoScript filenames are
+conventional Unity classnames whose downstream lookups go through GUIDs
+regardless, and mirror-package vendoring (UniTask vs. Zenject both
+shipping a `Runtime/Utils/L.cs`) makes the path-based depth-2 alias
+structurally ambiguous. The GUID suffix is intrinsic to the asset —
+survives `git mv` and is independent of sibling churn. 8 hex chars =
+~0.01% birthday-collision odds at N=1000; on the rare collision the
+bake still hard-fails and the user can regenerate one of the GUIDs.
 
 **Hard-fail on shared depth-2 parent.** Two contestants whose hints share
 the same last 2 parent dirs (e.g. `Assets/X/Y/Foo.prefab` and
@@ -228,20 +240,25 @@ depth-2 rule exists to kill.
 
 **What stays stable / what still drifts.** A contested entry's alias is
 independent of which siblings exist: adding or removing an unrelated
-co-colliding asset never perturbs the others. The only remaining drift is
-the bare ↔ suffix promote/demote at the contest boundary: a previously
-unique `Foo` flips to `Foo^P/Q` the moment a second `Foo` lands anywhere,
-and the surviving entry pops back to bare if the sibling is later removed.
-Persisting an alias of a contested asset across bakes is safe; persisting
-bare aliases that *could* become contested is not. GUIDs remain the only
-truly stable identifier.
+co-colliding asset never perturbs the others. The remaining drift is the
+ext-bare ↔ ext-with-`^path` promote/demote at the contest boundary
+within a single ext bucket — a unique `Foo.prefab` flips to
+`Foo.prefab^P/Q` the moment a second same-ext `Foo.prefab` lands
+anywhere, and pops back if the sibling is later removed. Cross-ext
+same-stem siblings (`Foo.prefab` + `Foo.cs`) DON'T cause this flip
+because they sit in distinct buckets. GUIDs remain the only truly stable
+identifier.
 
 The `^` separator is rare in Unity asset paths and (unlike parens) doesn't
 collide with naturally-paren-named assets like `QuestWidget (Side).prefab`.
 
-Pinned by `bake::tests::parent_suffix_*` (pure-helper semantics),
-`bake::tests::guid_suffix_uses_first_8_hex_of_guid` + `build_db_uses_guid_suffix_for_contested_monoscripts`
-(MonoScript carve-out), `bake::tests::build_db_renames_every_claimant_when_name_is_contested`
+Pinned by `bake::tests::build_db_always_appends_ext_to_alias`,
+`build_db_disambiguates_cross_ext_collision_via_ext_suffix` (BoxKey
+case), `build_db_disambiguates_script_typed_cross_ext_via_ext_suffix`
+(Orgel timeline case), `parent_suffix_*` (pure-helper semantics),
+`guid_suffix_uses_first_8_hex_of_guid` +
+`build_db_uses_guid_suffix_for_contested_monoscripts` (MonoScript
+carve-out), `build_db_renames_every_claimant_when_name_is_contested`
 (no-winner rule), `build_db_contested_alias_is_independent_of_other_siblings`
 (stability), and `build_db_fails_when_two_contestants_share_depth_2_parent`
 (hard-fail).
@@ -258,7 +275,7 @@ The default bake leaves YAML `m_Name` values verbatim. Consumers whose
 serialization grammar reserves certain characters (e.g. `/`, `|`, `#`, `\`)
 can pass a `name_sanitizer` callback in `BakeOptions` that returns
 `Some(rewritten)` for any name that would collide with their grammar. The
-bake re-runs the sanitizer once per top-level filename stem and once per
+bake re-runs the sanitizer once per top-level `<stem>.<ext>` and once per
 sub-asset name, before dedup; warnings flow through `on_warn`.
 
 [`ignore`]: https://docs.rs/ignore

@@ -178,14 +178,14 @@ fn find_substring_case_insensitive() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    let hits = query::find(&db, "foo"); // lowercase against `Foo`
+    let hits = query::find(&db, "foo"); // lowercase against `Foo.prefab`
     assert_eq!(hits.len(), 1);
-    assert_eq!(&*hits[0].name, "Foo");
+    assert_eq!(&*hits[0].name, "Foo.prefab");
 
     // Substring across all entries.
     let hits2 = query::find(&db, "ar");
     let names: Vec<&str> = hits2.iter().map(|e| e.name.as_ref()).collect();
-    assert!(names.contains(&"Bar"));
+    assert!(names.contains(&"Bar.asset"));
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn list_filters_by_native_classid() {
     )
     .collect();
     assert_eq!(prefabs.len(), 1);
-    assert_eq!(&*prefabs[0].name, "Foo");
+    assert_eq!(&*prefabs[0].name, "Foo.prefab");
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn list_filters_by_script_guid() {
     let scripts: Vec<_> =
         query::list(&db, Some(AssetTypeFilter::Script(script_guid))).collect();
     assert_eq!(scripts.len(), 1);
-    assert_eq!(&*scripts[0].name, "Bar");
+    assert_eq!(&*scripts[0].name, "Bar.asset");
 }
 
 #[test]
@@ -273,9 +273,9 @@ fn alias_exact_match_returns_entries() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    let hits = query::alias(&db, "Foo", "");
+    let hits = query::alias(&db, "Foo.prefab", "");
     assert_eq!(hits.len(), 1);
-    assert_eq!(&*hits[0].name, "Foo");
+    assert_eq!(&*hits[0].name, "Foo.prefab");
 }
 
 #[test]
@@ -330,11 +330,14 @@ fn alias_with_scrub_chars_matches_scrubbed_form() {
     let db = query::open(&out_dir).unwrap();
 
     // Without auto-scrub, raw input misses.
-    assert!(query::alias(&db, "sample^v1", "").is_empty());
-    // With auto-scrub, raw input hits.
-    let hits = query::alias(&db, "sample^v1", "^");
+    assert!(query::alias(&db, "sample^v1.asset", "").is_empty());
+    // With auto-scrub, raw input hits — the sanitizer rewrote `^` to `_`
+    // before dedup so the stored name is `sample_v1.asset`. (Auto-scrub
+    // is applied to the input as a whole, including the `.asset` tail —
+    // since the tail has no scrubbed chars, it survives intact.)
+    let hits = query::alias(&db, "sample^v1.asset", "^");
     assert_eq!(hits.len(), 1);
-    assert_eq!(&*hits[0].name, "sample_v1");
+    assert_eq!(&*hits[0].name, "sample_v1.asset");
 }
 
 #[test]

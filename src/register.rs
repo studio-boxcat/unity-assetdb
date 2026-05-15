@@ -390,11 +390,13 @@ fn update_db_for(
         guid,
         asset_type: parsed_at,
         hint,
-        name,
         meta_mtime_ns,
         asset_mtime_ns,
         sub_assets,
     } = parsed;
+    // Mint the always-ext alias the next full bake would derive — keeps
+    // register-inserted rows from churning on the following `bake`.
+    let name = bake::filename_with_ext_from_hint(&hint);
 
     let cached_asset_type = match parsed_at {
         ParsedAssetType::Native(n) => CachedAssetType::Native(n),
