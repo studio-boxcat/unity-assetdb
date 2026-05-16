@@ -38,13 +38,13 @@ just install                                   # cargo install --path . → ~/.c
 # Bake the index. Auto-synthesizes missing `.meta` files (see asset-database.md).
 unity-assetdb bake [--project <path>] [--out-dir <path>] [--scrub-chars <chars>]
 
-# Queries (TSV by default, --json opt-in). Exit 1 when nothing matches
-# (guid/path/alias, or `usage <path>` with an unresolved path); exit 0
-# otherwise. `find` / `list` and `usage`'s file scan never miss
-# (empty output = empty result).
+# Queries (TSV by default, --json opt-in). Name/path lookups
+# (guid/path/find/alias, or `usage <path>` with an unresolved path)
+# exit 1 on miss and print fuzzy "did you mean" suggestions to stderr.
+# `list` and `usage`'s file scan never miss (empty output = empty result).
 unity-assetdb guid  <path|pattern>             # exact hint → 1 row; else substring on hints
 unity-assetdb path  <guid>                     # → project-rel hint
-unity-assetdb find  <pattern>                  # case-insensitive substring on names
+unity-assetdb find  <pattern>                  # case-insensitive substring on names; suggests on miss
 unity-assetdb list  [--type <kind>]            # all entries, optional ClassId or Script:<32hex>
 unity-assetdb alias <name> [--scrub-chars <c>] # exact-match (auto-scrubs input). Names are `<stem>.<ext>` — see [[asset-database.md#name-collisions]].
 unity-assetdb usage <guid|path>                # path\tline\ttext for every YAML file referencing the GUID

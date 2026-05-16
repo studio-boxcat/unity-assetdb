@@ -12,8 +12,9 @@
 //!   incrementally update the bin.
 //!
 //! Output discipline: data → stdout, warnings / suggestions / progress →
-//! stderr. Exit codes: 0 = OK / hit, 1 = miss on a point lookup, 2 = bad
-//! usage or I/O / corruption error.
+//! stderr. Exit codes: 0 = OK / hit, 1 = miss on a name/path lookup
+//! (`guid`/`path`/`find`/`alias`, or `usage <path>` with an unresolved
+//! path), 2 = bad usage or I/O / corruption error.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -72,8 +73,9 @@ enum Commands {
         out: OutputOpts,
         guid: String,
     },
-    /// Case-insensitive substring match on asset names. Prints all hits;
-    /// empty output (no suggestions) when nothing matches.
+    /// Case-insensitive substring match on asset names. Prints all hits.
+    /// On a miss, emits fuzzy "did you mean" suggestions to stderr (same
+    /// as `alias`) and exits 1.
     Find {
         #[command(flatten)]
         common: CommonOpts,
@@ -293,6 +295,10 @@ fn run_find(common: CommonOpts, out: OutputOpts, pattern: &str) -> anyhow::Resul
     let out_dir = resolve_out_dir(&common)?;
     let db = query::open(&out_dir)?;
     let hits = query::find(&db, pattern);
+    if hits.is_empty() {
+        print_miss("name", pattern, db.entries.iter().map(|e| e.name.as_ref()));
+        return Ok(ExitCode::from(1));
+    }
     // Bulk emit — `Stdout` is unbuffered when piped, so without
     // `BufWriter` 18 k `writeln!` calls would be 18 k write syscalls.
     let stdout = std::io::stdout();

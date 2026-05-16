@@ -12,7 +12,8 @@
 //! - [`alias`] — exact-match name lookup. Optional `scrub_chars` applies the
 //!   bake's scrub policy to the input before compare.
 //!
-//! Misses on the point lookups (`guid`/`path`/`alias`) feed [`crate::suggest`].
+//! Misses on every CLI name/path lookup (`guid`/`path`/`find`/`alias`,
+//! plus `usage <path>`) feed [`crate::suggest`].
 
 use crate::class_id::ClassId;
 use crate::store::{self, AssetDb, AssetEntry, AssetType, StoreError};
