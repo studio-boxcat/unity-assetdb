@@ -13,6 +13,19 @@ Originally extracted from a Unity prefab YAML ↔ JSON converter. Reusable by
 any tool that wants the same GUID→name index — e.g. a Rust-side
 asset-catalog baker for the Unity client.
 
+## Workspace layout
+
+The repo is a Cargo workspace. The root crate is `unity-assetdb` (the bake +
+query pipeline below). One sub-crate lives under `crates/`:
+
+- [`unity-path-rules`](crates/unity-path-rules) — universal Unity filesystem
+  predicates (`is_unity_hidden`, `is_opaque_plugin_dir`, `is_submodule_root`,
+  `is_opaque_subtree`). Extracted so other tools — e.g.
+  [`unity-meta-cop`](https://github.com/studio-boxcat/unity-meta-cop) — can
+  honor the same ignore rules without depending on the bake pipeline. Tool-
+  specific exclusions (e.g. `is_blacklisted_extension` for this crate's name
+  pool) stay private to `unity-assetdb`.
+
 ## Crate layout
 
 - `store` — on-disk schema (`AssetDb`, `AssetEntry`, `SubAsset`, `AssetType`).

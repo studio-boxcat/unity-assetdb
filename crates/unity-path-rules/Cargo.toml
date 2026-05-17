@@ -1,0 +1,14 @@
+[package]
+name = "unity-path-rules"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Predicates that mirror Unity's filesystem importer rules: hidden-name detection (`.foo` / `foo~`), opaque-plugin folders (`.androidlib` / `.androidpack` / `.aar`), and submodule roots. Useful for any tool that walks a Unity project the way Unity itself does."
+repository = "https://github.com/studio-boxcat/unity-assetdb"
+keywords = ["unity", "gamedev", "filesystem", "tooling"]
+categories = ["game-development", "filesystem"]
+
+[lib]
+name = "unity_path_rules"
+path = "src/lib.rs"

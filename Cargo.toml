@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/unity-path-rules"]
+
 [package]
 name = "unity-assetdb"
 version = "0.2.0"
@@ -35,6 +38,7 @@ getrandom = { version = "0.2", features = ["std"] }
 ignore = "0.4"
 memchr = "2"
 thiserror = "2"
+unity-path-rules = { version = "0.1", path = "crates/unity-path-rules" }
 clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]

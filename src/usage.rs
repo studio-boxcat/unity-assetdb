@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use memchr::memmem;
+use unity_path_rules::is_unity_hidden;
 
-use crate::walk::{WalkError, is_unity_hidden};
+use crate::walk::WalkError;
 
 /// Unity YAML asset extensions. Anything outside this set is skipped to
 /// avoid grepping textures/audio/.dll binaries. If users hit a gap, the

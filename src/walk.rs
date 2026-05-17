@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
+pub(crate) use unity_path_rules::is_unity_hidden;
+use unity_path_rules::is_opaque_subtree;
 
 /// Errors from walking the Unity project tree.
 #[derive(Debug, thiserror::Error)]
@@ -377,31 +379,6 @@ fn walk_dir_collect(
     Ok(())
 }
 
-/// A directory whose *contents* should never receive synthesized
-/// `.meta` files: folder-based Android plugins (Unity hands them to
-/// Gradle as-is) and git submodule roots (foreign working trees).
-fn is_opaque_subtree(name: &std::ffi::OsStr, path: &Path) -> bool {
-    is_opaque_plugin_dir(name) || is_submodule_root(path)
-}
-
-/// Folder-based Android plugin names per Unity's manifest:
-/// `.androidlib` (Gradle module), `.androidpack` (Play Asset Delivery),
-/// `.aar` (folder form of an Android archive).
-/// <https://docs.unity3d.com/Manual/android-library-project-import.html>
-fn is_opaque_plugin_dir(name: &std::ffi::OsStr) -> bool {
-    Path::new(name)
-        .extension()
-        .is_some_and(|e| e == "androidlib" || e == "androidpack" || e == "aar")
-}
-
-/// Git submodule (or nested independent repo) root: `<dir>/.git` exists
-/// as either a file (submodule pointer) or directory (worktree-style
-/// embedded repo). Either case means the subtree is owned by another
-/// repo and our synthesized `.meta` files would show up as dirty.
-fn is_submodule_root(dir: &Path) -> bool {
-    dir.join(".git").exists()
-}
-
 /// Shared `WalkBuilder` config for every asset walk in this crate.
 ///
 /// `standard_filters(false)`: gitignore parsing in a Unity project is a
@@ -418,14 +395,6 @@ fn asset_walk_builder(root: &Path) -> WalkBuilder {
         .follow_links(false)
         .filter_entry(|e| !is_unity_hidden(e.file_name()));
     b
-}
-
-/// Unity-hidden file-name predicate: `.foo` or `foo~` per Unity's
-/// special-folder rule. Byte-level — non-UTF-8 filenames (rare but
-/// possible on Unix) would silently slip through a `to_str()` check.
-pub(crate) fn is_unity_hidden(name: &std::ffi::OsStr) -> bool {
-    let bytes = name.as_encoded_bytes();
-    bytes.first() == Some(&b'.') || bytes.last() == Some(&b'~')
 }
 
 /// File extensions the asset-db refuses to index. Files with these
