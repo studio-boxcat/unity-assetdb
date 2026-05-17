@@ -1,3 +1,6 @@
 # TODO
 
 - **CLI integration tests.** No `tests/` coverage for the binary's stdout / stderr / exit-code contracts — only library APIs are tested. A small `assert_cmd`-based suite covering `guid` / `path` / `find` / `alias` / `usage` miss paths (exit 1, `did you mean:` on stderr) and hit paths (TSV / `--json` shapes) would lock the UX. Noted while normalising `find`'s miss UX (CLAUDE.md item 11).
+- **Clippy: `doc_lazy_continuation` at `src/store.rs:41`.** Pre-existing — `cargo clippy --all-targets -- -D warnings` fails on it. One-line indent fix (see clippy suggestion). Surfaced while running clippy across the workspace after the `unity-path-rules` extract.
+- **`unity-path-rules` publish dep gap.** Root `Cargo.toml` declares `unity-path-rules = { version = "0.1", path = "crates/unity-path-rules" }`. `cargo publish` for `unity-assetdb` will fail until `unity-path-rules` itself is published to crates.io. Either publish the sub-crate first, or strip the `version` field when going to crates.io.
+- **`unity-path-rules` tests for I/O predicates.** `is_submodule_root` and `is_opaque_subtree` have no tests (they touch the filesystem). A small tempdir-based test for each would lock semantics — currently only the pure predicates (`is_unity_hidden`, `is_opaque_plugin_dir`) have coverage.
