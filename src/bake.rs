@@ -721,10 +721,14 @@ fn process_one_uncached(
         let info = asset::parse(&asset_text, mode)?;
         top_class_id = info.top_class_id;
         script_guid = info.script_guid;
+        // Empty `m_Name` is fine — Unity-addressable sub-docs (Mesh /
+        // Curve / generated-content bodies inside `.asset`) routinely
+        // ship with no authored name. Consumers address them via
+        // `$@Parent#<fid>` ("Embedded sub-asset, unnamed"); they need
+        // the (parent_guid, file_id) entry in the index even without a
+        // name to round-trip. The structural `is_filterable_subdoc_for_ext`
+        // gate (GO/Transform/RectTransform on prefabs) still applies.
         for s in info.sub_assets {
-            if s.name.is_empty() {
-                continue;
-            }
             if is_filterable_subdoc_for_ext(s.class_id, ext) {
                 continue;
             }
@@ -923,6 +927,20 @@ fn build_db(
             continue;
         }
         for sub in r.sub_assets.iter_mut() {
+            // Empty-named sub-assets bypass the global dedup pool. Real
+            // Unity-addressable sub-docs (Mesh / Curve / generated-content
+            // bodies inside `.asset`) routinely ship with no authored
+            // name; consumers address them via `$@Parent#<fid>` ("Embedded
+            // sub-asset, unnamed") — `(parent_guid, fid)` is the lookup
+            // key, the empty name is not. Forcing them through dedup
+            // would collide across parents (every Box_*.asset has 30+
+            // empty-named Meshes) and hit the no-suffix-can-disambiguate
+            // bail in `collision_suffix`. Empty-named subs still land in
+            // the parent's `sub_assets` vec — that's what
+            // `is_local_subasset(parent_guid, fid)` checks downstream.
+            if sub.name.is_empty() {
+                continue;
+            }
             let sub_type = AssetTypeRaw::Native(sub.class_id);
             if contested(&sub.name, sub_type) {
                 let original = sub.name.to_string();

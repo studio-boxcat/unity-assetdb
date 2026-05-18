@@ -63,28 +63,44 @@ pub fn parse(text: &str, mode: ParseMode) -> Result<AssetInfo> {
     let mut doc_idx: usize = 0;
     let mut cur: Option<DocAccum> = None;
 
-    let flush = |info: &mut AssetInfo, doc_idx: usize, d: DocAccum| {
+    let flush = |info: &mut AssetInfo, doc_idx: usize, mode: ParseMode, d: DocAccum| {
         if doc_idx == 0 {
             info.top_class_id = Some(d.class_id);
             info.top_file_id = Some(d.file_id);
             info.script_guid = d.script_guid;
-        } else {
-            // class_id is propagated through to `SubAsset` in store.rs —
-            // critical for prefab-embedded sub-docs whose hashed negative
-            // fileID can't be reverse-derived to a class via the
-            // `file_id = class * 100_000` heuristic.
-            info.sub_assets.push(SubAssetEntry {
-                class_id: d.class_id,
-                file_id: d.file_id,
-                name: d.name.unwrap_or_default(),
-            });
+            // In `TopOnly` mode the caller only needs the top doc's
+            // class/script identity — sub_assets stays empty. Skip the
+            // push so the contract "TopOnly produces empty sub_assets"
+            // holds for `.prefab` / `.mat` / `.mask` / `.unity`.
+            if mode == ParseMode::TopOnly {
+                return;
+            }
         }
+        // Every doc lands in `sub_assets` for `WithSubAssets` mode —
+        // including the first. Consumers gate "is this the main asset?"
+        // via the meta-driven `mainObjectFileID` (pspec's
+        // `lookup_sub_asset` filters when `parent.canonical_fid ==
+        // file_id`). The first YAML doc isn't always the main: `.asset`
+        // files commonly emit a sub-MB first with the main MB later
+        // (`mainObjectFileID: 11400000` in .meta). Without including the
+        // first doc, downstream `is_local_subasset` misses the non-main
+        // top doc and refs to it leak as typed-raw `&#<fid>|<Type>`
+        // instead of `$<Sub>@<Parent>` / `$@Parent#<fid>`. class_id is
+        // propagated through to `SubAsset` in store.rs — critical for
+        // prefab-embedded sub-docs whose hashed negative fileID can't
+        // be reverse-derived to a class via the
+        // `file_id = class * 100_000` heuristic.
+        info.sub_assets.push(SubAssetEntry {
+            class_id: d.class_id,
+            file_id: d.file_id,
+            name: d.name.unwrap_or_default(),
+        });
     };
 
     for line in text.lines() {
         if let Some((cls, fid)) = parse_doc_header(line) {
             if let Some(d) = cur.take() {
-                flush(&mut info, doc_idx, d);
+                flush(&mut info, doc_idx, mode, d);
                 doc_idx += 1;
                 // TopOnly: stop the moment we've finished the first doc.
                 if mode == ParseMode::TopOnly {
@@ -118,7 +134,7 @@ pub fn parse(text: &str, mode: ParseMode) -> Result<AssetInfo> {
         }
     }
     if let Some(d) = cur.take() {
-        flush(&mut info, doc_idx, d);
+        flush(&mut info, doc_idx, mode, d);
     }
     Ok(info)
 }
@@ -165,7 +181,12 @@ PrefabInstance:
         let info = parse(text, ParseMode::WithSubAssets).unwrap();
         assert_eq!(info.top_class_id, Some(1001));
         assert_eq!(info.top_file_id, Some(100100000));
-        assert!(info.sub_assets.is_empty());
+        // `WithSubAssets` mode includes the top doc in sub_assets too —
+        // consumers filter by `mainObjectFileID` to distinguish main vs.
+        // sub. For single-doc files the lone entry represents that doc.
+        assert_eq!(info.sub_assets.len(), 1);
+        assert_eq!(info.sub_assets[0].file_id, 100100000);
+        assert_eq!(info.sub_assets[0].class_id, 1001);
     }
 
     #[test]
@@ -214,10 +235,15 @@ Sprite:
 ";
         let info = parse(text, ParseMode::WithSubAssets).unwrap();
         assert_eq!(info.top_class_id, Some(28));
-        assert_eq!(info.sub_assets.len(), 2);
-        assert_eq!(info.sub_assets[0].file_id, 21300000);
-        assert_eq!(info.sub_assets[0].name, "spr_a");
-        assert_eq!(info.sub_assets[1].name, "spr_b");
+        // All 3 docs land in sub_assets — the top (Texture2D) plus the
+        // two named Sprite sub-docs. Consumers gate "is this the main
+        // asset?" via `mainObjectFileID` from .meta.
+        assert_eq!(info.sub_assets.len(), 3);
+        assert_eq!(info.sub_assets[0].file_id, 2800000);
+        assert_eq!(info.sub_assets[0].name, "Sheet");
+        assert_eq!(info.sub_assets[1].file_id, 21300000);
+        assert_eq!(info.sub_assets[1].name, "spr_a");
+        assert_eq!(info.sub_assets[2].name, "spr_b");
     }
 
     /// `asset::parse` is class-blind: every named sub-doc surfaces
@@ -240,13 +266,15 @@ AnimationClip:
   m_Name: EmbeddedClip
 ";
         let info = parse(text, ParseMode::WithSubAssets).unwrap();
-        // 3 named sub-docs (the class-114 top doc is the parent, not a sub).
-        // The line-oriented parser preserves YAML quote literals — Unity's
-        // typical output uses single-quoted strings for names with special
-        // chars; the sanitize / strip-quote pass happens downstream.
-        assert_eq!(info.sub_assets.len(), 3);
-        assert_eq!(info.sub_assets[0].name, "'Animation Track (1)'");
-        assert_eq!(info.sub_assets[1].name, "'@SomeGo'");
-        assert_eq!(info.sub_assets[2].name, "EmbeddedClip");
+        // 4 entries: the class-114 top doc + 3 sub-docs. The line-
+        // oriented parser preserves YAML quote literals — Unity's
+        // typical output uses single-quoted strings for names with
+        // special chars; the sanitize / strip-quote pass happens
+        // downstream.
+        assert_eq!(info.sub_assets.len(), 4);
+        assert_eq!(info.sub_assets[0].name, "TimelineAsset");
+        assert_eq!(info.sub_assets[1].name, "'Animation Track (1)'");
+        assert_eq!(info.sub_assets[2].name, "'@SomeGo'");
+        assert_eq!(info.sub_assets[3].name, "EmbeddedClip");
     }
 }

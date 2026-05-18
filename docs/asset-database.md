@@ -46,7 +46,7 @@ Each `AssetEntry`:
 | `guid` | `u128` | 32-hex Unity GUID. |
 | `asset_type` | `AssetType` | Tagged enum — `Native(class_id)` or `Script(script_idx)`. See [Asset typing](#asset-typing). |
 | `name` | `Box<str>` | `<stem>.<ext>` derived from `hint` on every bake, with optional collision suffix appended. See [Name collisions](#name-collisions). |
-| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Sub-asset rows (sprite-sheet entries, sub-clips, plus the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures — fileID `21300000` = `ClassId::Sprite × 100_000`, name = bare filename stem (sub-assets carry no ext); synthesized at bake since `.meta` omits it). `class_id` stored explicitly so prefab-embedded sub-asset rows (whose hashed fileIDs would otherwise collapse via the `file_id / 100_000` heuristic) retain their real Unity class. Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
+| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Every addressable doc inside this asset, regardless of whether it's the file's "top" (first YAML doc) or "main" per `.meta::mainObjectFileID`. Consumers gate "is this row the main asset?" by comparing `file_id` against the parent entry's canonical-fid (`asset_type_to_file_id`) or, for files where `.meta::mainObjectFileID` is non-canonical, the meta-driven value. Includes sprite-sheet entries, sub-clips, the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures (fileID `21300000` = `ClassId::Sprite × 100_000`, name = bare filename stem; synthesized at bake since `.meta` omits it), and empty-named sub-docs (Mesh/Curve bodies in `.asset`, embedded clips that don't author `m_Name`) — empty-named rows stay in the parent's vec but bypass the global alias-bucket dedup since the empty name can't disambiguate. `class_id` stored explicitly so prefab-embedded sub-asset rows (whose hashed fileIDs would otherwise collapse via the `file_id / 100_000` heuristic) retain their real Unity class. Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
 | `hint` | `Box<str>` | Project-root-relative path (`Assets/Foo.prefab`, `Packages/com.boxcat.libs/Bar.mixer`). Lets downstream consumers locate assets by guid without re-walking the project tree. |
 
 `Box<str>` instead of `String` saves 8 bytes per string (no growable-capacity field) once decoded.
@@ -202,6 +202,24 @@ carries the parent's ext (`$Foo@Bar.prefab`). Prefab-embedded sub-assets
 `.controller`, AudioMixerGroup in a `.mixer`, Timeline tracks in a
 `.playable`) are EXCLUDED from the global pool entirely; they live in
 their parent's namespace and resolve through the same `$…@…` scheme.
+
+**Empty-name bypass:** sub-asset docs whose YAML carries no `m_Name`
+(Mesh / Curve / generated-content bodies inside `.asset`, anonymous
+embedded clips, etc.) remain in the parent's `sub_assets` vec but
+bypass the global alias-bucket dedup pool — every Box_*.asset hosts
+30+ empty-named Mesh sub-docs and forcing them through the dedup-claim
+step would collide across parents without any name suffix able to
+disambiguate. Consumers address these via the `(parent_guid, file_id)`
+pair (e.g. pspec's `$@Parent#<fid>` "Embedded sub-asset, unnamed" form
+— `#<fid>` is mandatory on that shape).
+
+**First-doc inclusion:** under `WithSubAssets` parse mode every YAML
+doc lands in `sub_assets` — including the first. The earlier "top doc
+excluded" rule incorrectly conflated YAML order with main-asset
+identity; `.asset` files commonly emit a sub-MB first and pin
+`mainObjectFileID: 11400000` (the synthetic canonical-fid MB) as the
+main. Consumers gate "is this the main?" via the meta-driven
+`mainObjectFileID`, not by YAML position.
 
 **No-winner rule:** when ≥ 2 distinct guids claim the same
 `(name, asset_type)` pair (same stem + same ext + same type), **every**
