@@ -1181,6 +1181,12 @@ const GUID_SUFFIX_LEN: usize = 8;
 /// is intrinsic to the asset: survives `git mv` and is independent of
 /// sibling churn.
 ///
+/// `^` is the same separator [`parent_suffix`] uses; both code paths
+/// flag the alias as bake-disambiguated rather than authored, and the
+/// character is rare enough in real Unity asset paths that it's safe to
+/// surface in `$Alias` refs without confusing readers (unlike `_`,
+/// which is common in filenames).
+///
 /// 8-hex collisions across two distinct GUIDs are exceptionally rare;
 /// when they do happen, [`claim`] still hard-fails — the user can
 /// regenerate one of the colliding script GUIDs to resolve.
@@ -1206,6 +1212,13 @@ fn guid_suffix(stem: &str, guid: u128) -> String {
 /// caller (`build_db`) is responsible for detecting cross-contestant
 /// suffix collisions (two hints whose last `min_parents` segments are
 /// identical) post-hoc; this helper just emits the candidate.
+///
+/// `^` is a rare char in real Unity asset paths and visually flags the
+/// alias as bake-added rather than authored. Folder names with
+/// pspec-ref-grammar reserved chars (`!`, `|`, `@`, `#`) pass through
+/// verbatim here; pspec's `validate_asset_alias_for_ref` catches them
+/// lazily at ref-compose time so editor-only assets nothing references
+/// stay harmless.
 ///
 /// See [Name collisions](docs/asset-database.md#name-collisions) for the
 /// `^` separator rationale.
