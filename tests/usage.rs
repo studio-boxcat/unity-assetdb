@@ -55,8 +55,8 @@ fn fresh_project(label: &str) -> PathBuf {
     root
 }
 
-/// Run the canonical `BakeOptions` (silent sinks, no sanitizer) against
-/// `root`. Mirrors `bake_at` in tests/bake.rs and tests/query.rs.
+/// Run the canonical `BakeOptions` (silent sinks) against `root`.
+/// Mirrors `bake_at` in tests/bake.rs and tests/query.rs.
 fn bake_at(root: &Path) -> PathBuf {
     let out_dir = root.join("Library").join("unity-assetdb");
     let opts = BakeOptions {

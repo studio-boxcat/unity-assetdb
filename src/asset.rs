@@ -267,10 +267,10 @@ AnimationClip:
 ";
         let info = parse(text, ParseMode::WithSubAssets).unwrap();
         // 4 entries: the class-114 top doc + 3 sub-docs. The line-
-        // oriented parser preserves YAML quote literals — Unity's
-        // typical output uses single-quoted strings for names with
-        // special chars; the sanitize / strip-quote pass happens
-        // downstream.
+        // oriented parser preserves YAML quote literals verbatim —
+        // Unity's typical output uses single-quoted strings for names
+        // with special chars, and downstream consumers see the quotes
+        // as part of the name.
         assert_eq!(info.sub_assets.len(), 4);
         assert_eq!(info.sub_assets[0].name, "TimelineAsset");
         assert_eq!(info.sub_assets[1].name, "'Animation Track (1)'");

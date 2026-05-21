@@ -8,7 +8,7 @@ use unity_assetdb::bake::{BakeOptions, bake};
 use unity_assetdb::store;
 
 /// Drives the `BakeOptions` API with the canonical
-/// `<root>/Library/unity-assetdb/` out dir, no sanitizer, silent sinks.
+/// `<root>/Library/unity-assetdb/` out dir and silent sinks.
 fn bake_at(root: &Path) -> PathBuf {
     let out_dir = out_dir_for(root);
     let opts = BakeOptions {
