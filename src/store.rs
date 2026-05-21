@@ -36,7 +36,7 @@ use crate::class_id::ClassId;
 ///      share their alias bucket with same-named entries of a different
 ///      `asset_type` — type-aware reverse lookup discriminates at query
 ///      time. See [Name collisions](docs/asset-database.md#name-collisions).
-///   Pre-v5 bakes are unreadable; re-bake required after upgrading.
+///      Pre-v5 bakes are unreadable; re-bake required after upgrading.
 /// - v6: `.prefab`/`.controller`/`.anim`/`.mixer`/`.playable` sub-asset
 ///   rows now exclude the GameObject-tree structural classes (GameObject,
 ///   Transform, RectTransform, MonoBehaviour-as-component scoped to

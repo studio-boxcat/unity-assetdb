@@ -1023,6 +1023,7 @@ fn bake_does_not_synthesize_inside_git_submodules() {
 ///      meta-walker → no entries in `asset-db.bin`.
 ///   2. Bare `.md` / `.pspec` files without sibling `.meta` are skipped by
 ///      the missing-meta pre-pass → no `.meta` synthesized for them.
+///
 /// The companion real asset (`Foo.prefab`) is unaffected.
 #[test]
 fn bake_excludes_sidecar_md_and_pspec_files() {

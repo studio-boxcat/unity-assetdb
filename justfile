@@ -64,20 +64,47 @@ compare BEFORE AFTER: _check-meow-client
       "/tmp/uadb-before bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}" \
       "/tmp/uadb-after  bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}"
 
-# Cold + warm wall-clock runs via hyperfine, then a per-phase line.
+# Cold + warm + steady-state wall-clock runs via hyperfine, then a
+# per-phase line. Labels match the post-Watchman architecture (see
+# docs/refresh.md): cold = no bin, warm = full bake against existing
+# bin, steady-state = a `find` query exercising auto-refresh.
 profile: build _check-meow-client
     @command -v hyperfine >/dev/null || (echo "hyperfine not installed (brew install hyperfine)" && exit 1)
     @mkdir -p {{PROFILE_OUT}}
-    @echo "=== cold (no cache, no db) ==="
+    @echo "=== cold (no bin) ==="
     hyperfine --warmup 2 --runs 5 \
-      --prepare "rm -f {{PROFILE_OUT}}/asset-db.bin {{PROFILE_OUT}}/asset-db.cache.bin" \
+      --prepare "rm -f {{PROFILE_OUT}}/asset-db.bin" \
       "{{BIN}} bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}"
-    @echo "=== warm (full cache hit) ==="
+    @echo "=== warm (re-bake against existing bin) ==="
     hyperfine --warmup 2 --runs 5 \
       "{{BIN}} bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}"
-    @echo "=== phase breakdown (warm) ==="
+    @echo "=== steady-state query (auto-refresh, empty delta) ==="
+    hyperfine --warmup 2 --runs 10 \
+      "{{BIN}} find ___nope___ --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}"
+    @echo "=== phase breakdown (full bake) ==="
     UNITY_ASSETDB_TIMING=1 {{BIN}} bake --project {{MEOW_CLIENT}} --out-dir {{PROFILE_OUT}}
     @ls -lh {{PROFILE_OUT}}
+
+# --- release ------------------------------------------------------------
+
+# Publish both crates to crates.io in dependency order. `unity-path-rules`
+# goes first because `unity-assetdb`'s Cargo.toml declares it as
+# `{ version = "0.1", path = "..." }` — cargo uses the path locally but
+# crates.io publish requires the same version to exist on the registry.
+#
+# Prereqs: `cargo login` already done (token in ~/.cargo/credentials).
+# Run `just publish-dry-run` first to validate the package contents
+# without uploading.
+publish:
+    cargo publish -p unity-path-rules
+    @echo "waiting for crates.io to index unity-path-rules..."
+    @sleep 15
+    cargo publish -p unity-assetdb
+
+# Validate the package contents for both crates without uploading.
+publish-dry-run:
+    cargo publish -p unity-path-rules --dry-run
+    cargo publish -p unity-assetdb --dry-run
 
 # Internal: bail if the meow-tower checkout isn't at MEOW_CLIENT.
 _check-meow-client:

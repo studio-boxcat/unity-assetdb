@@ -45,8 +45,12 @@ clap = { version = "4", features = ["derive"], optional = true }
 watchman_client = "0.9"
 tokio = { version = "1", default-features = false, features = ["rt", "net"] }
 
-# No [dev-dependencies] needed — tests use a homemade `unique_tmp` helper
-# (see `tests/bake.rs`) over `std::env::temp_dir`.
+[dev-dependencies]
+# `assert_cmd` drives the binary as a subprocess for the CLI contract
+# suite (`tests/cli.rs`) — covers exit codes, stdout shape (TSV +
+# `--json`), and stderr (miss + "did you mean:" suggestions). Pulls in
+# `predicates` transitively for the stdout/stderr matchers.
+assert_cmd = "2"
 
 # Keep line tables in release so samply can symbolicate flamegraphs.
 [profile.release]
