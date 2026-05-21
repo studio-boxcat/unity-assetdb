@@ -5,7 +5,7 @@ members = [".", "crates/unity-path-rules"]
 name = "unity-assetdb"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "Unity asset GUID → name index baker. Walks Assets/, parses .meta and asset YAML, writes a compact bincode database."
 repository = "https://github.com/studio-boxcat/unity-assetdb"
@@ -33,10 +33,10 @@ cli = ["dep:clap"]
 ahash = "0.8"
 anyhow = "1"
 bincode = "2"
-fs2 = "0.4"
 getrandom = { version = "0.2", features = ["std"] }
 ignore = "0.4"
 memchr = "2"
+tempfile = "3"
 thiserror = "2"
 unity-path-rules = { version = "0.1", path = "crates/unity-path-rules" }
 clap = { version = "4", features = ["derive"], optional = true }

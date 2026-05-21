@@ -240,6 +240,9 @@ pub enum LockWait {
 
 /// Acquire an exclusive advisory flock on `<dir>/.asset-db.lock`. Returns
 /// a guard that releases on drop. Shared by bake and register.
+///
+/// Backed by [`std::fs::File::lock`]/[`std::fs::File::try_lock`] (stable
+/// since Rust 1.89): `flock(2)` on Unix, `LockFileEx` on Windows.
 pub fn acquire_lock(dir: &Path, wait: LockWait) -> Result<LockGuard, StoreError> {
     let path = lock_path(dir);
     let file = std::fs::OpenOptions::new()
@@ -260,16 +263,19 @@ pub fn acquire_lock(dir: &Path, wait: LockWait) -> Result<LockGuard, StoreError>
     };
     match wait {
         LockWait::TryOnce => {
-            fs2::FileExt::try_lock_exclusive(&file).map_err(|e| io_err("try-lock", e))?;
+            // `register.rs` matches `source.kind() == WouldBlock` to detect
+            // contention, so the `WouldBlock` discriminant must survive the
+            // `TryLockError → io::Error` adapter here.
+            file.try_lock().map_err(|e| io_err("try-lock", try_lock_to_io(e)))?;
         }
         LockWait::Forever => {
-            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_err("lock", e))?;
+            file.lock().map_err(|source| io_err("lock", source))?;
         }
         LockWait::Until(timeout) => {
             let start = std::time::Instant::now();
             let tick = std::time::Duration::from_millis(50);
             loop {
-                if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
+                if file.try_lock().is_ok() {
                     break;
                 }
                 if start.elapsed() >= timeout {
@@ -288,6 +294,13 @@ pub fn acquire_lock(dir: &Path, wait: LockWait) -> Result<LockGuard, StoreError>
     Ok(LockGuard { file })
 }
 
+fn try_lock_to_io(e: std::fs::TryLockError) -> std::io::Error {
+    match e {
+        std::fs::TryLockError::WouldBlock => std::io::ErrorKind::WouldBlock.into(),
+        std::fs::TryLockError::Error(e) => e,
+    }
+}
+
 /// RAII guard for the advisory flock acquired by [`acquire_lock`]. POSIX
 /// flock releases on FD close; the explicit unlock here is belt-and-braces.
 pub struct LockGuard {
@@ -296,7 +309,7 @@ pub struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -395,36 +408,44 @@ fn check_magic<'a>(
     Ok(body)
 }
 
-/// Atomic write: stage payload at `<path>.tmp.<pid>`, then `rename` over
-/// the destination. Concurrent readers always see either the old or the
-/// new bytes; a process crash mid-write leaves the prior file intact.
+/// Atomic write: stage payload in a sibling tempfile, `fsync`, then
+/// `rename` over the destination. Concurrent readers always see either
+/// the old or the new bytes; a process crash mid-write leaves the prior
+/// file intact (and [`tempfile::NamedTempFile`] cleans up its random-named
+/// stage file on drop).
+///
 /// Mitigates the "register clobbers a mid-flight bake" race that the
 /// advisory flock on the out_dir is the primary defense against.
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-            op: "create dir",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let tmp = {
-        let mut t = path.as_os_str().to_owned();
-        t.push(format!(".tmp.{}", std::process::id()));
-        std::path::PathBuf::from(t)
-    };
-    std::fs::write(&tmp, bytes).map_err(|source| StoreError::Io {
-        op: "write tmp",
-        path: tmp.clone(),
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+        op: "create dir",
+        path: parent.to_path_buf(),
         source,
     })?;
-    std::fs::rename(&tmp, path).map_err(|source| {
-        let _ = std::fs::remove_file(&tmp);
-        StoreError::Io {
-            op: "rename",
-            path: path.to_path_buf(),
-            source,
-        }
+
+    // Stage in the destination directory so `persist` is a same-fs `rename(2)`.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|source| StoreError::Io {
+        op: "create tmp",
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    tmp.write_all(bytes).map_err(|source| StoreError::Io {
+        op: "write tmp",
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+    tmp.as_file().sync_all().map_err(|source| StoreError::Io {
+        op: "fsync tmp",
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+    tmp.persist(path).map_err(|e| StoreError::Io {
+        op: "rename",
+        path: path.to_path_buf(),
+        source: e.error,
     })?;
     Ok(())
 }
@@ -538,6 +559,50 @@ mod tests {
         let bytes = encode(&db).unwrap();
         let err = decode(&bytes).unwrap_err().to_string();
         assert!(err.contains("schema"), "expected schema-version error, got: {err}");
+    }
+
+    /// `write_bytes` is atomic via stage-and-rename; on success no
+    /// intermediate file may remain in the destination directory.
+    /// Pins this contract so the next implementation swap can't
+    /// regress to a stage file that leaks (the previous
+    /// `.tmp.<pid>` scheme would orphan on process crash; the
+    /// modern `tempfile`-backed version cleans up on drop).
+    #[test]
+    fn write_bytes_leaves_no_temp_sibling_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asset-db.bin");
+        write(&path, &AssetDb::new()).unwrap();
+
+        let siblings: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            siblings,
+            vec![std::ffi::OsString::from("asset-db.bin")],
+            "post-write dir should contain only the final bin; got {siblings:?}",
+        );
+    }
+
+    /// `acquire_lock(TryOnce)` errs while another guard holds the
+    /// flock, and succeeds once that guard drops. Pins the
+    /// contention contract independently of the underlying
+    /// implementation (currently `std::fs::File::try_lock`, formerly
+    /// `fs2::FileExt::try_lock_exclusive`).
+    #[test]
+    fn acquire_lock_try_once_blocks_then_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_lock(dir.path(), LockWait::TryOnce).expect("first acquire");
+        match acquire_lock(dir.path(), LockWait::TryOnce) {
+            Ok(_) => panic!("second acquire must fail while first holds"),
+            Err(StoreError::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
+            }
+            Err(e) => panic!("expected Io error on contention, got {e:?}"),
+        }
+        drop(first);
+        let _second = acquire_lock(dir.path(), LockWait::TryOnce)
+            .expect("acquire after first dropped");
     }
 
     /// `SubAsset.class_id` is a v5+ field. Pin that a round-trip
