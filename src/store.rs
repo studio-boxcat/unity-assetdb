@@ -302,7 +302,7 @@ impl Drop for LockGuard {
 
 // ─── Errors ──────────────────────────────────────────────────────────────
 
-/// Errors from reading/writing the on-disk asset-db / cache binaries.
+/// Errors from reading/writing `asset-db.bin`.
 ///
 /// Distinguishes filesystem errors (path-tagged), envelope-level
 /// validation (magic + schema), and the underlying `bincode` codec
