@@ -10,12 +10,14 @@
 //!   (project-rel path). Powers the `guid` CLI fallback.
 //! - [`list`] — full or type-filtered iterator.
 //! - [`alias`] — exact-match name lookup.
+//! - [`find_sub_asset`] — `(guid, file_id) → SubAsset` forward lookup.
+//! - [`sub_assets_by_guid_iter`] — iterator over a parent's sub-assets.
 //!
 //! Misses on every CLI name/path lookup (`guid`/`path`/`find`/`alias`,
 //! plus `usage <path>`) feed [`crate::suggest`].
 
 use crate::class_id::ClassId;
-use crate::store::{self, AssetDb, AssetEntry, AssetType, StoreError};
+use crate::store::{self, AssetDb, AssetEntry, AssetType, StoreError, SubAsset};
 use std::path::Path;
 
 /// Errors from the query layer.
@@ -171,6 +173,29 @@ pub fn alias<'a>(db: &'a AssetDb, name: &str) -> Vec<&'a AssetEntry> {
     db.entries.iter().filter(|e| &*e.name == name).collect()
 }
 
+/// `(guid, file_id)` → sub-asset within that parent's `sub_assets` list.
+/// Returns `None` when either the parent guid is unknown or no sub-asset
+/// row carries the requested `file_id`.
+///
+/// Forward complement to the `AssetEntry.sub_assets` reverse-by-name
+/// surface; consumers (e.g. prefab-YAML converters) want
+/// `(parent, fileID)` resolution on the hot path.
+pub fn find_sub_asset(db: &AssetDb, guid: u128, file_id: i64) -> Option<&SubAsset> {
+    let entry = db.find_by_guid(guid)?;
+    entry.sub_assets.iter().find(|s| s.file_id == file_id)
+}
+
+/// Iterate every sub-asset belonging to `guid`. Empty iterator when the
+/// guid is unknown or the entry has no sub-assets. Use when the caller
+/// wants to scan or filter the whole sub-asset list (the
+/// `entry.sub_assets.iter()` path is open-coded otherwise).
+pub fn sub_assets_by_guid_iter(db: &AssetDb, guid: u128) -> impl Iterator<Item = &SubAsset> {
+    db.find_by_guid(guid)
+        .map(|e| e.sub_assets.as_slice())
+        .unwrap_or(&[])
+        .iter()
+}
+
 /// Parse a 32-hex GUID. Hyphens and uppercase tolerated. Fast path for
 /// the no-hyphen common case skips the strip-allocation.
 pub fn parse_guid(s: &str) -> Result<u128, QueryError> {
@@ -206,6 +231,66 @@ pub fn asset_type_str(t: AssetType, db: &AssetDb) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SubAsset;
+
+    fn db_with_sub_assets() -> AssetDb {
+        let mut db = AssetDb::new();
+        db.entries.push(AssetEntry {
+            guid: 0xaabb_u128,
+            asset_type: AssetType::native(ClassId::Texture2D),
+            name: "Sheet".into(),
+            sub_assets: vec![
+                SubAsset {
+                    file_id: 21300000,
+                    class_id: ClassId::Sprite as u32,
+                    name: "spr_a".into(),
+                },
+                SubAsset {
+                    file_id: 21300002,
+                    class_id: ClassId::Sprite as u32,
+                    name: "spr_b".into(),
+                },
+            ],
+            hint: "Assets/Sheet.png".into(),
+        });
+        db.sort();
+        db
+    }
+
+    #[test]
+    fn find_sub_asset_returns_matching_row() {
+        let db = db_with_sub_assets();
+        let s = find_sub_asset(&db, 0xaabb_u128, 21300002).unwrap();
+        assert_eq!(&*s.name, "spr_b");
+        assert_eq!(s.class_id, ClassId::Sprite as u32);
+    }
+
+    #[test]
+    fn find_sub_asset_misses_unknown_guid() {
+        let db = db_with_sub_assets();
+        assert!(find_sub_asset(&db, 0xdead_u128, 21300000).is_none());
+    }
+
+    #[test]
+    fn find_sub_asset_misses_unknown_file_id() {
+        let db = db_with_sub_assets();
+        assert!(find_sub_asset(&db, 0xaabb_u128, 99999999).is_none());
+    }
+
+    #[test]
+    fn sub_assets_by_guid_iter_yields_in_order() {
+        let db = db_with_sub_assets();
+        let names: Vec<&str> = sub_assets_by_guid_iter(&db, 0xaabb_u128)
+            .map(|s| &*s.name)
+            .collect();
+        assert_eq!(names, vec!["spr_a", "spr_b"]);
+    }
+
+    #[test]
+    fn sub_assets_by_guid_iter_unknown_guid_is_empty() {
+        let db = db_with_sub_assets();
+        assert_eq!(sub_assets_by_guid_iter(&db, 0xdead_u128).count(), 0);
+    }
 
     #[test]
     fn parse_guid_accepts_lowercase_uppercase_hyphens() {

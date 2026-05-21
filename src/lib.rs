@@ -15,12 +15,14 @@
 //! - [`watch`] — Watchman wire layer (`since`, `Delta`, `WatchError`).
 //! - [`refresh`] — auto-refresh orchestrator: watch::since → patch | full-bake.
 //! - [`query`] — read-only lookups against a baked `asset-db.bin`.
+//! - [`builtin`] — Unity engine-builtin GUID predicates (shape + bucket).
 //! - [`register`] — synthesize a `.meta` outside Unity, incremental db insert.
 //! - [`suggest`] — fuzzy "did you mean" helper used by the query CLI.
 //! - [`usage`] — scan project files for references to a given GUID.
 
 pub mod asset;
 pub mod bake;
+pub mod builtin;
 pub mod class_id;
 pub mod meta;
 pub mod query;
