@@ -47,7 +47,6 @@ fn bake_at(root: &Path) -> PathBuf {
     let opts = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir.clone(),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,
@@ -63,7 +62,6 @@ fn register_opts(root: &Path, out_dir: &Path, target: PathBuf) -> RegisterOption
         out_dir: out_dir.to_path_buf(),
         target,
         importer_override: None,
-        scrub_chars: None,
         lock_timeout: Duration::from_secs(5),
     }
 }
@@ -187,25 +185,6 @@ fn register_unknown_extension_falls_back_to_default() {
 
     let meta_text = fs::read_to_string(target.with_extension("xyz.meta")).unwrap();
     assert!(meta_text.contains("DefaultImporter:"));
-}
-
-#[test]
-fn register_applies_scrub_chars_to_entry_name() {
-    let root = unique_tmp("scrub");
-    let _ = fs::remove_dir_all(&root);
-    make_empty_project(&root);
-    let out_dir = bake_at(&root);
-
-    let target = root.join("Assets/sample^v1.asset");
-    write(&target, "%YAML 1.1\n--- !u!114 &11400000\nMonoBehaviour:\n  m_Script: {fileID: 11500000, guid: ffff7777ffff7777ffff7777ffff7777, type: 3}\n  m_Name: x\n");
-
-    let mut opts = register_opts(&root, &out_dir, target);
-    opts.scrub_chars = Some("^".to_owned());
-    let outcome = register(&opts).unwrap();
-
-    let db = store::read(&store::db_path(&out_dir)).unwrap();
-    let entry = db.find_by_guid(outcome.guid).unwrap();
-    assert_eq!(&*entry.name, "sample_v1.asset");
 }
 
 #[test]

@@ -193,11 +193,6 @@ pub struct RegisterOptions {
     /// Override the ext-derived importer kind. Errors if it differs from
     /// the existing `.meta`'s importer block (when a meta is already on disk).
     pub importer_override: Option<ImporterKind>,
-    /// If `Some(non-empty)`, apply this scrub set to the new entry's
-    /// `name` before insert — mirrors `bake --scrub-chars`. Callers
-    /// running bake with a scrub set MUST pass the same value here, else
-    /// the registered entry won't match consumers' lookup conventions.
-    pub scrub_chars: Option<String>,
     /// Block this long acquiring `<out_dir>/.asset-db.lock`. `Duration::ZERO`
     /// = try-lock only (immediate `LockHeld` on contention).
     pub lock_timeout: Duration,
@@ -255,12 +250,7 @@ pub fn register(opts: &RegisterOptions) -> Result<RegisterOutcome, RegisterError
 
     let (guid, created_meta) = synthesize_or_read_meta(&target_abs, &meta_path, opts)?;
 
-    let db_updated = update_db_for(
-        &project_root,
-        &opts.out_dir,
-        &meta_path,
-        opts.scrub_chars.as_deref(),
-    )?;
+    let db_updated = update_db_for(&project_root, &opts.out_dir, &meta_path)?;
 
     Ok(RegisterOutcome {
         guid,
@@ -374,7 +364,6 @@ fn update_db_for(
     project_root: &Path,
     out_dir: &Path,
     meta_path: &Path,
-    scrub_chars: Option<&str>,
 ) -> Result<bool, RegisterError> {
     let db_path = store::db_path(out_dir);
 
@@ -401,10 +390,6 @@ fn update_db_for(
     let asset_type = match parsed_at {
         ParsedAssetType::Native(n) => AssetType::Native(n),
         ParsedAssetType::Script(g) => AssetType::Script(db.intern_script(g)),
-    };
-    let name = match scrub_chars {
-        Some(chars) if !chars.is_empty() => query::scrub_in(&name, chars),
-        _ => name,
     };
 
     if let Some(existing) = db.find_by_guid(guid)

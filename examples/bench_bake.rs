@@ -41,7 +41,6 @@ fn main() {
     let opts = || BakeOptions {
         project_root: project.clone(),
         out_dir: out_dir.clone(),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,

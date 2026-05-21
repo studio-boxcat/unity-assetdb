@@ -49,20 +49,9 @@ pub enum BakeError {
     Other(#[from] anyhow::Error),
 }
 
-/// Caller-supplied name sanitizer. Returns `Some(rewritten)` when the
-/// input contains characters the consumer wants to scrub from asset
-/// names; `None` to keep the input as-is. Bake calls this once per
-/// top-level filename stem and once per sub-asset YAML `m_Name`.
-///
-/// Bound is `Send + Sync + 'static` because [`BakeOptions`] flows into
-/// `ignore::WalkParallel` worker closures.
-///
-/// Default behavior (no sanitizer) leaves all names verbatim.
-pub type NameSanitizer = Box<dyn Fn(&str) -> Option<String> + Send + Sync + 'static>;
-
 /// Caller-supplied warning sink. Bake invokes this for non-fatal events
-/// (worker errors during the parallel walk, name-collision rewrites,
-/// sanitizer rewrites). The library never writes to stderr itself.
+/// (worker errors during the parallel walk, name-collision rewrites).
+/// The library never writes to stderr itself.
 pub type WarnSink = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
 /// Caller-supplied progress sink. Bake invokes this with the post-bake
@@ -71,14 +60,10 @@ pub type WarnSink = Box<dyn Fn(&str) + Send + Sync + 'static>;
 /// "info" output and warnings to different places.
 pub type ProgressSink = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
-/// Borrowed view of a [`NameSanitizer`] for internal helpers. Kept as a
-/// named type so per-call signatures don't trip clippy's `type_complexity`.
-type NameSanitizerRef<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
-
-/// Borrowed view of a [`WarnSink`]. See [`NameSanitizerRef`].
+/// Borrowed view of a [`WarnSink`].
 type WarnSinkRef<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
-/// Borrowed view of a [`ProgressSink`]. See [`NameSanitizerRef`].
+/// Borrowed view of a [`ProgressSink`].
 type ProgressSinkRef<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
 /// File extensions whose asset has embedded sub-asset docs that should
@@ -229,8 +214,6 @@ pub struct BakeOptions {
     /// convention (e.g. `<project>/Library/unity-assetdb/` or a
     /// fixture-staging path).
     pub out_dir: PathBuf,
-    /// Optional name sanitizer; see [`NameSanitizer`].
-    pub name_sanitizer: Option<NameSanitizer>,
     /// Optional warning sink; see [`WarnSink`]. `None` discards warnings.
     pub on_warn: Option<WarnSink>,
     /// Optional progress sink; see [`ProgressSink`]. `None` discards the
@@ -353,12 +336,7 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
     for v in raw_rx.iter() {
         raw.extend(v);
     }
-    let mut db = build_db(
-        raw,
-        opts.name_sanitizer.as_deref(),
-        opts.on_warn.as_deref(),
-        opts.verbose_collisions,
-    )?;
+    let mut db = build_db(raw, opts.on_warn.as_deref(), opts.verbose_collisions)?;
     let t_build = t_start.elapsed();
 
     // Seed the Watchman clock so the next `refresh` can ask for a
@@ -542,7 +520,7 @@ pub(crate) fn raw_from_entry(entry: &AssetEntry, script_types: &[u128]) -> RawEn
 /// Sinks default to silent — refresh's patch path doesn't surface
 /// dedup warnings (steady-state should be no-op).
 pub(crate) fn build_db_from_raw(raw: Vec<RawEntry>) -> Result<AssetDb, BakeError> {
-    build_db(raw, None, None, false).map_err(map_bake_err)
+    build_db(raw, None, false).map_err(map_bake_err)
 }
 
 fn raw_to_parsed(r: RawEntry) -> ParsedEntry {
@@ -733,43 +711,41 @@ fn synthesize_implicit_sprite(meta: &meta::MetaInfo, stem: &str) -> Option<SubAs
     }
 }
 
-fn warn_sanitized(on_warn: Option<WarnSinkRef<'_>>, kind: &str, hint: &str, old: &str, new: &str) {
-    if let Some(sink) = on_warn {
-        sink(&format!(
-            "warning: {kind} {hint} name `{old}` contains ref-reserved char; renamed to `{new}`",
-        ));
+/// Hard-fail on `/` in any asset / sub-asset name. `kind` is "asset"
+/// for top-level, "sub-asset of" for embedded — surfaces in the error
+/// message so the user can locate the offending YAML.
+fn reject_slash(name: &str, kind: &str, hint: &str) -> Result<()> {
+    if name.contains('/') {
+        anyhow::bail!(
+            "{kind} `{hint}` has name `{name}` containing `/`; \
+             reserved as a path separator and structural delimiter \
+             in downstream reference grammars. Fix the source YAML \
+             (top-level stems can't contain `/` on Unix; sub-asset \
+             names come from `m_Name`).",
+        );
     }
+    Ok(())
 }
 
 fn build_db(
     mut raw: Vec<RawEntry>,
-    sanitizer: Option<NameSanitizerRef<'_>>,
     on_warn: Option<WarnSinkRef<'_>>,
     verbose_collisions: bool,
 ) -> Result<AssetDb> {
     // Stable order: sort by hint so dedup picks the same "winner" each bake.
     raw.sort_by(|a, b| a.hint.cmp(&b.hint));
 
-    // Reset every entry's name to its raw `<stem>.<ext>` before dedup,
-    // then sanitize ref-reserved chars in both top-level and sub-asset
-    // names — covers the three name sources (filename stem, YAML m_Name
-    // sub-assets, `.meta` sprite-sheet entries) in one pass before dedup
-    // uses `r.name` as key.
+    // Reset every entry's name to its raw `<stem>.<ext>` before dedup.
+    // Top-level stems can never contain `/` on Unix (it's the path
+    // separator); sub-asset names come from YAML `m_Name` and might.
+    // Reject `/` universally — every consumer-side reference grammar
+    // we've seen uses it as a structural delimiter, and silently
+    // rewriting it would mask a malformed asset YAML.
     for r in raw.iter_mut() {
         r.name = filename_with_ext_from_hint(&r.hint);
-        if let Some(san) = sanitizer
-            && let Some(clean) = san(&r.name)
-        {
-            warn_sanitized(on_warn, "asset", &r.hint, &r.name, &clean);
-            r.name = clean;
-        }
-        if let Some(san) = sanitizer {
-            for sub in r.sub_assets.iter_mut() {
-                if let Some(clean) = san(&sub.name) {
-                    warn_sanitized(on_warn, "sub-asset of", &r.hint, &sub.name, &clean);
-                    sub.name = clean.into_boxed_str();
-                }
-            }
+        reject_slash(&r.name, "asset", &r.hint)?;
+        for sub in &r.sub_assets {
+            reject_slash(&sub.name, "sub-asset of", &r.hint)?;
         }
     }
 
@@ -1404,7 +1380,7 @@ mod tests {
             ),
         ];
 
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
 
         let a_entry = db.find_by_guid(png_a_guid).unwrap();
         let b_entry = db.find_by_guid(png_b_guid).unwrap();
@@ -1445,7 +1421,7 @@ mod tests {
             raw_native("Assets/X/Y/Foo.prefab", a_guid, vec![]),
             raw_native("Assets/P/Q/Foo.prefab", b_guid, vec![]),
         ];
-        let db_two = build_db(raw_two, None, None, false).unwrap();
+        let db_two = build_db(raw_two, None, false).unwrap();
         let a_name_two = db_two.find_by_guid(a_guid).unwrap().name.clone();
         let b_name_two = db_two.find_by_guid(b_guid).unwrap().name.clone();
 
@@ -1457,7 +1433,7 @@ mod tests {
             raw_native("Assets/P/Q/Foo.prefab", b_guid, vec![]),
             raw_native("Assets/M/N/Foo.prefab", c_guid, vec![]),
         ];
-        let db_three = build_db(raw_three, None, None, false).unwrap();
+        let db_three = build_db(raw_three, None, false).unwrap();
         let a_name_three = db_three.find_by_guid(a_guid).unwrap().name.clone();
         let b_name_three = db_three.find_by_guid(b_guid).unwrap().name.clone();
 
@@ -1498,7 +1474,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         assert_eq!(&*db.find_by_guid(a_guid).unwrap().name, "L.cs^9ddf5ad8");
         assert_eq!(&*db.find_by_guid(b_guid).unwrap().name, "L.cs^3751098b");
     }
@@ -1517,7 +1493,7 @@ mod tests {
             raw_native("Assets/X/Y/Foo.png", a_guid, vec![]),
             raw_native("Outer/X/Y/Foo.png", b_guid, vec![]),
         ];
-        let err = build_db(raw, None, None, false)
+        let err = build_db(raw, None, false)
             .expect_err("identical depth-2 suffix must hard-fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("Foo"), "msg should name the stem: {msg}");
@@ -1556,7 +1532,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         // Each entry's alias is `<stem>.<ext>`; distinct exts → distinct
         // buckets → both uncontested.
         assert_eq!(&*db.find_by_guid(png_guid).unwrap().name, "Foo.png");
@@ -1604,7 +1580,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         // Standalone gets `Idle.asset` under the always-ext rule.
         assert_eq!(
             &*db.find_by_guid(other_state_guid).unwrap().name,
@@ -1650,7 +1626,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         assert_eq!(
             &*db.find_by_guid(other_group_guid).unwrap().name,
             "Master.asset",
@@ -1705,7 +1681,7 @@ mod tests {
                 }],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         // Both playables keep their embedded track names as authored —
         // sub-assets live in the parent's namespace, not the global pool.
         assert_eq!(
@@ -1750,7 +1726,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         // Standalone .anim gets `Animation.anim` — the prefab-embedded
         // `Animation` sub-asset is excluded from the global pool and
         // never contests.
@@ -1781,7 +1757,7 @@ mod tests {
             }],
         )];
 
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         let entry = db.find_by_guid(png_guid).unwrap();
         // Top-level carries the always-ext suffix; the same-name Sprite
         // sub-asset stays bare (sub-assets have no file extension).
@@ -1805,7 +1781,7 @@ mod tests {
             
             sub_assets: vec![],
         }];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         assert_eq!(&*db.find_by_guid(guid).unwrap().name, "README");
     }
 
@@ -1827,7 +1803,7 @@ mod tests {
             sub_assets: vec![],
         }];
 
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         assert_eq!(&*db.find_by_guid(prefab_guid).unwrap().name, "Foo.prefab");
     }
 
@@ -1881,7 +1857,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         assert_eq!(
             &*db.find_by_guid(scene_guid).unwrap().name,
             "BoxKeyObtainLongtake.unity",
@@ -1930,7 +1906,7 @@ mod tests {
                 sub_assets: vec![],
             },
         ];
-        let db = build_db(raw, None, None, false).expect("build_db should succeed");
+        let db = build_db(raw, None, false).expect("build_db should succeed");
         assert_eq!(
             &*db.find_by_guid(asset_guid).unwrap().name,
             "OrgelActivityTimeline.asset",
@@ -1957,7 +1933,7 @@ mod tests {
             raw_native("Foo.png", 0x02_u128, vec![]),
         ];
 
-        let err = build_db(raw, None, None, false)
+        let err = build_db(raw, None, false)
             .expect_err("collision with no parent dirs must hard-fail");
         let msg = format!("{err:#}");
         assert!(

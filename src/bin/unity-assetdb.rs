@@ -52,11 +52,6 @@ enum Commands {
     Bake {
         #[command(flatten)]
         common: CommonOpts,
-        /// Characters to scrub from asset names (replaced with `_`). Each
-        /// char is treated as an individual scrub target. Pass the same
-        /// value to `query alias` / `register` so names round-trip.
-        #[arg(long, value_name = "CHARS")]
-        scrub_chars: Option<String>,
     },
     /// Project-relative path → entry row. Exact-hint match returns the
     /// single row; otherwise falls back to a case-insensitive substring
@@ -98,17 +93,13 @@ enum Commands {
         r#type: Option<String>,
     },
     /// Exact-name lookup. Returns all entries sharing the name (across
-    /// asset types). Auto-applies `--scrub-chars` to the input so callers
-    /// can pass the raw filename.
+    /// asset types). Names are `<stem>.<ext>`; see
+    /// [`docs/asset-database.md#name-collisions`].
     Alias {
         #[command(flatten)]
         common: CommonOpts,
         #[command(flatten)]
         out: OutputOpts,
-        /// Scrub chars to apply to the input before compare (mirror the
-        /// `bake --scrub-chars` value).
-        #[arg(long, value_name = "CHARS")]
-        scrub_chars: Option<String>,
         name: String,
     },
     /// Scan project YAML assets for references to a GUID. Arg accepts
@@ -131,10 +122,6 @@ enum Commands {
         /// Accepts both `NativeFormat` and `NativeFormatImporter` spellings.
         #[arg(long, value_name = "IMPORTER")]
         r#type: Option<String>,
-        /// Scrub chars to apply to the new entry's name (mirror
-        /// `bake --scrub-chars`).
-        #[arg(long, value_name = "CHARS")]
-        scrub_chars: Option<String>,
         /// Block this many seconds for the out_dir flock. 0 = try once.
         #[arg(long, default_value_t = 30, value_name = "SECS")]
         lock_timeout: u64,
@@ -187,81 +174,47 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 fn run(cmd: Commands) -> anyhow::Result<ExitCode> {
     match cmd {
-        Commands::Bake { common, scrub_chars } => {
-            run_bake(common, scrub_chars)?;
+        Commands::Bake { common } => {
+            run_bake(common)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Guid { common, out, path } => run_guid(common, out, &path),
         Commands::Path { common, out, guid } => run_path(common, out, &guid),
         Commands::Find { common, out, pattern } => run_find(common, out, &pattern),
         Commands::List { common, out, r#type } => run_list(common, out, r#type.as_deref()),
-        Commands::Alias {
-            common,
-            out,
-            scrub_chars,
-            name,
-        } => run_alias(common, out, scrub_chars.as_deref(), &name),
+        Commands::Alias { common, out, name } => run_alias(common, out, &name),
         Commands::Usage { common, out, target } => run_usage(common, out, &target),
         Commands::Register {
             common,
             r#type,
-            scrub_chars,
             lock_timeout,
             path,
-        } => run_register(common, r#type.as_deref(), scrub_chars, lock_timeout, path),
+        } => run_register(common, r#type.as_deref(), lock_timeout, path),
     }
 }
 
 // ─── bake ────────────────────────────────────────────────────────────────
 
-fn run_bake(common: CommonOpts, scrub_chars: Option<String>) -> anyhow::Result<()> {
+fn run_bake(common: CommonOpts) -> anyhow::Result<()> {
     let (project_root, out_dir) = resolve_paths(&common)?;
-    let opts = build_bake_opts(project_root, out_dir, scrub_chars);
+    let opts = build_bake_opts(project_root, out_dir);
     bake(&opts)?;
     Ok(())
 }
 
-/// Build [`BakeOptions`] honoring env-var verbosity knobs. Shared by the
-/// explicit `bake` subcommand and the query auto-bake path; the latter
-/// always passes `scrub_chars = None` since query subcommands don't carry
-/// the flag (and an auto-baked index is a best-effort recovery — callers
-/// who rely on a scrub policy should still `bake --scrub-chars` once).
-fn build_bake_opts(
-    project_root: PathBuf,
-    out_dir: PathBuf,
-    scrub_chars: Option<String>,
-) -> BakeOptions {
+/// Build [`BakeOptions`] with env-var verbosity knobs. Shared by the
+/// explicit `bake` subcommand and the query auto-bake fallback path.
+fn build_bake_opts(project_root: PathBuf, out_dir: PathBuf) -> BakeOptions {
     let verbose_timing = std::env::var("UNITY_ASSETDB_TIMING").is_ok();
     let verbose_collisions = std::env::var("UNITY_ASSETDB_VERBOSE").is_ok();
-    let name_sanitizer = scrub_chars.map(|chars| {
-        let scrub: Vec<char> = chars.chars().collect();
-        let sanitizer: unity_assetdb::bake::NameSanitizer =
-            Box::new(move |s: &str| scrub_chars_in(s, &scrub));
-        sanitizer
-    });
     BakeOptions {
         project_root,
         out_dir,
-        name_sanitizer,
         on_warn: Some(Box::new(|m| eprintln!("{m}"))),
         on_progress: Some(Box::new(|m| eprintln!("{m}"))),
         verbose_timing,
         verbose_collisions,
     }
-}
-
-/// Replace each `scrub` char in `name` with `_`. Returns `Some(rewritten)`
-/// when at least one char was rewritten; `None` when the input was
-/// already clean.
-fn scrub_chars_in(name: &str, scrub: &[char]) -> Option<String> {
-    let first = name.char_indices().find(|(_, c)| scrub.contains(c))?;
-    let mut out = String::with_capacity(name.len());
-    out.push_str(&name[..first.0]);
-    out.push('_');
-    for c in name[first.0 + first.1.len_utf8()..].chars() {
-        out.push(if scrub.contains(&c) { '_' } else { c });
-    }
-    Some(out)
 }
 
 // ─── query: guid / path / find / list / alias ────────────────────────────
@@ -341,14 +294,9 @@ fn run_list(
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_alias(
-    common: CommonOpts,
-    out: OutputOpts,
-    scrub_chars: Option<&str>,
-    name: &str,
-) -> anyhow::Result<ExitCode> {
+fn run_alias(common: CommonOpts, out: OutputOpts, name: &str) -> anyhow::Result<ExitCode> {
     let db = open_db_or_refresh(&common)?;
-    let hits = query::alias(&db, name, scrub_chars.unwrap_or(""));
+    let hits = query::alias(&db, name);
     if hits.is_empty() {
         print_miss("alias", name, db.entries.iter().map(|e| e.name.as_ref()));
         return Ok(ExitCode::from(1));
@@ -410,7 +358,6 @@ fn write_usage_row(w: &mut impl Write, m: &UsageMatch, json: bool) -> std::io::R
 fn run_register(
     common: CommonOpts,
     type_str: Option<&str>,
-    scrub_chars: Option<String>,
     lock_timeout_secs: u64,
     target: PathBuf,
 ) -> anyhow::Result<ExitCode> {
@@ -429,7 +376,6 @@ fn run_register(
         out_dir,
         target,
         importer_override,
-        scrub_chars,
         lock_timeout: Duration::from_secs(lock_timeout_secs),
     };
     let outcome = register(&opts)?;
@@ -480,7 +426,7 @@ fn open_db_or_refresh(common: &CommonOpts) -> anyhow::Result<AssetDb> {
                 "asset-db unreadable or missing at {}; running full bake...",
                 store::db_path(&out_dir).display()
             );
-            let opts = build_bake_opts(project_root.clone(), out_dir.clone(), None);
+            let opts = build_bake_opts(project_root.clone(), out_dir.clone());
             bake(&opts)?;
             return Ok(query::open(&out_dir)?);
         }

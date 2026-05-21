@@ -9,8 +9,7 @@
 //! - [`find_by_hint`] — case-insensitive substring match on `hint`
 //!   (project-rel path). Powers the `guid` CLI fallback.
 //! - [`list`] — full or type-filtered iterator.
-//! - [`alias`] — exact-match name lookup. Optional `scrub_chars` applies the
-//!   bake's scrub policy to the input before compare.
+//! - [`alias`] — exact-match name lookup.
 //!
 //! Misses on every CLI name/path lookup (`guid`/`path`/`find`/`alias`,
 //! plus `usage <path>`) feed [`crate::suggest`].
@@ -168,31 +167,8 @@ pub fn list<'a>(
 /// Exact-match name lookup. Returns ALL entries with this name (the
 /// asset DB allows two entries with the same name when their
 /// `asset_type` differs — see `store.rs` v5 history).
-///
-/// `scrub_chars`, if non-empty, is applied to `name` before compare —
-/// callers pass the same `--scrub-chars` value the bake used so a raw
-/// filename (`Foo/Bar`) matches the stored, scrubbed form (`Foo_Bar`).
-pub fn alias<'a>(db: &'a AssetDb, name: &str, scrub_chars: &str) -> Vec<&'a AssetEntry> {
-    let needle = if scrub_chars.is_empty() {
-        name.to_owned()
-    } else {
-        scrub_in(name, scrub_chars)
-    };
-    db.entries.iter().filter(|e| *e.name == needle).collect()
-}
-
-/// Same scrub rule the CLI binary uses on `bake --scrub-chars`: replace
-/// each char in `scrub` with `_`. Idempotent under repeated application.
-pub fn scrub_in(name: &str, scrub_chars: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if scrub_chars.chars().any(|s| s == c) {
-            out.push('_');
-        } else {
-            out.push(c);
-        }
-    }
-    out
+pub fn alias<'a>(db: &'a AssetDb, name: &str) -> Vec<&'a AssetEntry> {
+    db.entries.iter().filter(|e| &*e.name == name).collect()
 }
 
 /// Parse a 32-hex GUID. Hyphens and uppercase tolerated. Fast path for
@@ -248,14 +224,6 @@ mod tests {
     fn normalize_hint_strips_dot_slash_and_backslash() {
         assert_eq!(normalize_hint("Assets\\Foo.prefab"), "Assets/Foo.prefab");
         assert_eq!(normalize_hint("./Assets/Foo.prefab"), "Assets/Foo.prefab");
-    }
-
-    #[test]
-    fn scrub_in_replaces_listed_chars() {
-        assert_eq!(scrub_in("Foo/Bar", "/"), "Foo_Bar");
-        assert_eq!(scrub_in("Already_clean", "/"), "Already_clean");
-        // Idempotent.
-        assert_eq!(scrub_in(&scrub_in("a/b", "/"), "/"), "a_b");
     }
 
     #[test]

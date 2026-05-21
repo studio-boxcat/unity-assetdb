@@ -62,7 +62,6 @@ fn bake_at(root: &Path) -> PathBuf {
     let opts = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir.clone(),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,

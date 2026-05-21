@@ -115,7 +115,6 @@ fn full_bake_into(
     let opts = BakeOptions {
         project_root: project_root.to_path_buf(),
         out_dir: out_dir.to_path_buf(),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,
@@ -228,7 +227,6 @@ mod tests {
         bake::bake(&BakeOptions {
             project_root: root.to_path_buf(),
             out_dir: out_dir.clone(),
-            name_sanitizer: None,
             on_warn: None,
             on_progress: None,
             verbose_timing: false,

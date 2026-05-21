@@ -56,7 +56,7 @@ query pipeline below). One sub-crate lives under `crates/`:
 just install                                   # cargo install --path . → ~/.cargo/bin/unity-assetdb
 
 # Bake the index. Auto-synthesizes missing `.meta` files (see asset-database.md).
-unity-assetdb bake [--project <path>] [--out-dir <path>] [--scrub-chars <chars>]
+unity-assetdb bake [--project <path>] [--out-dir <path>]
 
 # Queries (TSV by default, --json opt-in). Name/path lookups
 # (guid/path/find/alias, or `usage <path>` with an unresolved path)
@@ -66,14 +66,14 @@ unity-assetdb guid  <path|pattern>             # exact hint → 1 row; else subs
 unity-assetdb path  <guid>                     # → project-rel hint
 unity-assetdb find  <pattern>                  # case-insensitive substring on names; suggests on miss
 unity-assetdb list  [--type <kind>]            # all entries, optional ClassId or Script:<32hex>
-unity-assetdb alias <name> [--scrub-chars <c>] # exact-match (auto-scrubs input). Names are `<stem>.<ext>` — see [[asset-database.md#name-collisions]].
+unity-assetdb alias <name>                     # exact-match on `<stem>.<ext>` — see [[asset-database.md#name-collisions]].
 unity-assetdb usage <guid|path>                # path\tline\ttext for every YAML file referencing the GUID
 
 # Register a new asset without booting Unity. Synthesizes a minimal .meta
 # with a fresh 128-bit GUID; Unity refills the importer block on next focus
 # while preserving the GUID. Idempotent — re-running on an asset that
 # already has a .meta prints the existing GUID.
-unity-assetdb register <path> [--type <importer>] [--scrub-chars <c>] [--lock-timeout <secs>]
+unity-assetdb register <path> [--type <importer>] [--lock-timeout <secs>]
 ```
 
 Without `--project`, walks up from the cwd until both `Assets/` and `ProjectSettings/`
@@ -89,8 +89,10 @@ via [Watchman](docs/refresh.md) before serving its answer. Branches:
 - Watchman unreachable → full bake + one-line stderr nudge
   (`brew install watchman`).
 
-If the project relies on a scrub policy, run `bake --scrub-chars` once
-explicitly so the index round-trips with `alias`/`register`.
+Names containing `/` (top-level filename stems can't on Unix; sub-asset
+`m_Name` YAML fields can) **hard-fail** at bake time — `/` is universally
+reserved as a path separator and downstream ref-grammar delimiter, so
+silently rewriting it would mask malformed source YAML. Fix the source.
 
 Output discipline: data → stdout, warnings / suggestions / progress → stderr.
 TSV cells escape `\t`/`\n`/`\\`. JSON output is one object per line.

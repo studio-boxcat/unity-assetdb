@@ -69,7 +69,6 @@ fn bake_at(root: &Path) -> PathBuf {
     let opts = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir.clone(),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,
@@ -273,7 +272,7 @@ fn alias_exact_match_returns_entries() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    let hits = query::alias(&db, "Foo.prefab", "");
+    let hits = query::alias(&db, "Foo.prefab");
     assert_eq!(hits.len(), 1);
     assert_eq!(&*hits[0].name, "Foo.prefab");
 }
@@ -286,58 +285,7 @@ fn alias_miss_returns_empty() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    assert!(query::alias(&db, "Nope", "").is_empty());
-}
-
-#[test]
-fn alias_with_scrub_chars_matches_scrubbed_form() {
-    // Bake with `--scrub-chars '/'`: the texture name `Inner` stays as-is
-    // (no slash to scrub). But a name that contains a slash would be
-    // scrubbed to underscore at bake time. Here we instead pin that the
-    // query-side scrub correctly rewrites the input before compare —
-    // if we pass `Inner` AS-IS plus scrub_chars="_", we get a miss (input
-    // becomes `Inner` → matches), and with a fake-collision case below.
-    let root = unique_tmp("alias-scrub");
-    let _ = fs::remove_dir_all(&root);
-    make_basic_project(&root);
-
-    // Add a file whose stem contains `/`-equivalent — simulate by giving
-    // the bake a scrub set and naming a file with `^` (which we'll scrub).
-    write(&root.join("Assets/Tag/sample^v1.asset"), "%YAML 1.1\n--- !u!114 &11400000\nMonoBehaviour:\n  m_Script: {fileID: 11500000, guid: ffff5555ffff5555ffff5555ffff5555, type: 3}\n  m_Name: x\n");
-    write(
-        &root.join("Assets/Tag/sample^v1.asset.meta"),
-        "fileFormatVersion: 2\nguid: eeee5555eeee5555eeee5555eeee5555\nNativeFormatImporter: {}\n",
-    );
-
-    // Bake with `^` scrubbed → stored name `sample_v1`.
-    let out_dir = out_dir_for(&root);
-    let opts = BakeOptions {
-        project_root: root.to_path_buf(),
-        out_dir: out_dir.clone(),
-        name_sanitizer: Some(Box::new(move |s: &str| {
-            if s.contains('^') {
-                Some(s.replace('^', "_"))
-            } else {
-                None
-            }
-        })),
-        on_warn: None,
-        on_progress: None,
-        verbose_timing: false,
-        verbose_collisions: false,
-    };
-    bake(&opts).unwrap();
-    let db = query::open(&out_dir).unwrap();
-
-    // Without auto-scrub, raw input misses.
-    assert!(query::alias(&db, "sample^v1.asset", "").is_empty());
-    // With auto-scrub, raw input hits — the sanitizer rewrote `^` to `_`
-    // before dedup so the stored name is `sample_v1.asset`. (Auto-scrub
-    // is applied to the input as a whole, including the `.asset` tail —
-    // since the tail has no scrubbed chars, it survives intact.)
-    let hits = query::alias(&db, "sample^v1.asset", "^");
-    assert_eq!(hits.len(), 1);
-    assert_eq!(&*hits[0].name, "sample_v1.asset");
+    assert!(query::alias(&db, "Nope").is_empty());
 }
 
 #[test]

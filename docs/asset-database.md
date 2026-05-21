@@ -167,7 +167,6 @@ let project_root = resolve_project_root(None)?;
 let opts = BakeOptions {
     project_root: project_root.clone(),
     out_dir: project_root.join("Library").join("my-tool"),
-    name_sanitizer: None,        // Or Some(Box::new(|s| ...)) to scrub chars
     on_warn: Some(Box::new(|m| eprintln!("{m}"))),
     on_progress: Some(Box::new(|m| eprintln!("{m}"))),
     verbose_timing: false,
@@ -295,14 +294,19 @@ hand-edited corruption or duplicate-GUID copy-paste. Unity's "hidden" path
 conventions (folders/files starting with `.` or ending with `~`) are
 excluded from the walk so that template/scratch copies don't trip the check.
 
-### Optional name sanitization
+### Reserved-character policy
 
-The default bake leaves YAML `m_Name` values verbatim. Consumers whose
-serialization grammar reserves certain characters (e.g. `/`, `|`, `#`, `\`)
-can pass a `name_sanitizer` callback in `BakeOptions` that returns
-`Some(rewritten)` for any name that would collide with their grammar. The
-bake re-runs the sanitizer once per top-level `<stem>.<ext>` and once per
-sub-asset name, before dedup; warnings flow through `on_warn`.
+The bake leaves YAML `m_Name` values verbatim with one universal
+exception: **`/` is rejected at bake time** for any top-level or
+sub-asset name. The character is reserved as the Unix filesystem path
+separator *and* as a structural delimiter in every consumer-side
+reference grammar we've encountered; silently rewriting it would mask
+malformed source. The error surfaces through `BakeError` and names the
+offending hint so the user can fix the YAML.
+
+Other consumer-specific reserved chars (`#`, `@`, `|`, etc.) are not
+this crate's concern — consumers validate lazily at ref-compose time
+(e.g. `pspec`'s `compose_asset_shortcut`).
 
 [`ignore`]: https://docs.rs/ignore
 

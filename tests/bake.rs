@@ -14,7 +14,6 @@ fn bake_at(root: &Path) -> PathBuf {
     let opts = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir.clone(),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,
@@ -326,6 +325,52 @@ fn rebake_round_trips_sub_assets() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// Hard-fail when a sub-asset's `m_Name` carries a `/`. Top-level
+/// names come from filename stems and can't carry `/` on Unix; the
+/// failure surface is YAML-authored sub-asset names. The check fires
+/// at `build_db` time so callers see a clear "fix the source YAML"
+/// error rather than a silently mangled bin.
+#[test]
+fn slash_in_sub_asset_name_hard_fails() {
+    let root = unique_tmp("slash-reject");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+    // Texture with a sprite-sheet sub-asset whose name contains `/`.
+    write(&root.join("Assets/Tex/Sheet.png"), "fake-png-bytes");
+    write(
+        &root.join("Assets/Tex/Sheet.png.meta"),
+        "fileFormatVersion: 2
+guid: deadbeefdeadbeefdeadbeefdeadbeef
+TextureImporter:
+  spriteSheet:
+    sprites:
+    - serializedVersion: 2
+      name: bad/slash
+      internalID: 11111
+",
+    );
+
+    let opts = BakeOptions {
+        project_root: root.to_path_buf(),
+        out_dir: out_dir_for(&root),
+        on_warn: None,
+        on_progress: None,
+        verbose_timing: false,
+        verbose_collisions: false,
+    };
+    let err = bake(&opts).expect_err("expected hard-fail on `/` in sub-asset name");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("containing `/`") && msg.contains("sub-asset of"),
+        "expected slash-rejection message, got: {msg}",
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn duplicate_top_level_guid_hard_fails() {
     // Two .meta sharing a GUID (hand-edited copy-paste) — neither under a
@@ -357,7 +402,6 @@ fn duplicate_top_level_guid_hard_fails() {
     let opts = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir_for(&root),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: None,
         verbose_timing: false,
@@ -806,7 +850,6 @@ fn bake_creates_missing_meta_files() {
     let opts = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir_for(&root),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: Some(Box::new(move |m| {
             progress_clone.lock().unwrap().push(m.to_string());
@@ -882,7 +925,6 @@ fn bake_creates_missing_meta_files() {
     let opts2 = BakeOptions {
         project_root: root.to_path_buf(),
         out_dir: out_dir_for(&root),
-        name_sanitizer: None,
         on_warn: None,
         on_progress: Some(Box::new(move |m| {
             progress2_clone.lock().unwrap().push(m.to_string());
