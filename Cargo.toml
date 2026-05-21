@@ -3,7 +3,7 @@ members = [".", "crates/unity-path-rules"]
 
 [package]
 name = "unity-assetdb"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -40,12 +40,13 @@ memchr = "2"
 thiserror = "2"
 unity-path-rules = { version = "0.1", path = "crates/unity-path-rules" }
 clap = { version = "4", features = ["derive"], optional = true }
+# Watchman client + a minimal tokio runtime to drive its async API.
+# See docs/refresh.md for the sync-facade pattern.
+watchman_client = "0.9"
+tokio = { version = "1", default-features = false, features = ["rt", "net"] }
 
-[dev-dependencies]
-# `filetime` exposes a portable `set_file_mtime` for the cache-integrity
-# tests in tests/bake.rs — we need to drift mtimes on demand to exercise
-# the warm-path fast/slow-path bake branches.
-filetime = "0.2"
+# No [dev-dependencies] needed — tests use a homemade `unique_tmp` helper
+# (see `tests/bake.rs`) over `std::env::temp_dir`.
 
 # Keep line tables in release so samply can symbolicate flamegraphs.
 [profile.release]

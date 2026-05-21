@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use unity_assetdb::bake::{bake, BakeOptions};
+use unity_assetdb::refresh;
 use unity_assetdb::store;
 use unity_assetdb::walk::walk_for_missing_meta;
 
@@ -35,8 +36,8 @@ fn main() {
     let out_dir = PathBuf::from("/tmp/unity-assetdb-bench");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    // Prime: one warm bake to populate the cache so subsequent measures
-    // hit the cache-hit path.
+    // Prime: one bake to populate `asset-db.bin` so the in-memory-decode
+    // measures below have a real fixture to chew on.
     let opts = || BakeOptions {
         project_root: project.clone(),
         out_dir: out_dir.clone(),
@@ -48,47 +49,16 @@ fn main() {
     };
     bake(&opts()).expect("priming bake should succeed");
 
-    let cache_path = store::cache_path(&out_dir);
     let db_path = store::db_path(&out_dir);
-    let cache_bytes = std::fs::read(&cache_path).unwrap();
     let db_bytes = std::fs::read(&db_path).unwrap();
-    let cache = store::decode_cache(&cache_bytes).unwrap();
     let db = store::decode(&db_bytes).unwrap();
     println!(
-        "primed: project={} cache={} entries, db={} entries",
+        "primed: project={} db={} entries",
         project.display(),
-        cache.entries.len(),
         db.entries.len(),
     );
 
     println!("\n--- bake pipeline (each phase in isolation) ---");
-
-    measure(
-        "fs::read (cache.bin)",
-        || {
-            let b = std::fs::read(&cache_path).unwrap();
-            black_box(b);
-        },
-        50,
-    );
-
-    measure(
-        "store::decode_cache (in-memory bytes)",
-        || {
-            let c = store::decode_cache(&cache_bytes).unwrap();
-            black_box(c);
-        },
-        50,
-    );
-
-    measure(
-        "store::read_cache (read + decode)",
-        || {
-            let c = store::read_cache(&cache_path).unwrap();
-            black_box(c);
-        },
-        50,
-    );
 
     measure(
         "store::decode (asset-db.bin in-memory)",
@@ -113,9 +83,22 @@ fn main() {
     );
 
     measure(
-        "full bake (warm, all phases)",
+        "full bake (all phases)",
         || {
             bake(&opts()).unwrap();
+        },
+        20,
+    );
+
+    measure(
+        "refresh (Watchman empty-delta)",
+        || {
+            // Bin already primed; this exercises the steady-state
+            // `since`-and-no-op path. Whatever Watchman has tracked
+            // since the last `since` query gets folded in too.
+            let mut d = store::read(&db_path).unwrap();
+            refresh::refresh(&mut d, &project, &out_dir, None).unwrap();
+            black_box(d);
         },
         20,
     );

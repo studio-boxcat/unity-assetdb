@@ -13,7 +13,8 @@
 //! 4. Re-parse the asset via [`crate::bake::parse_one`] to compute the
 //!    same `AssetEntry` shape a `bake` would produce, intern any script
 //!    GUID, insert sorted into the loaded `AssetDb`, atomic-write
-//!    `asset-db.bin` and `asset-db.cache.bin`.
+//!    `asset-db.bin`. The next query's `refresh` picks up the new row
+//!    naturally — register does not bump the Watchman clock.
 //!
 //! "Minimal meta" assumption: Unity, on next focus, re-imports the asset
 //! and overwrites the importer block with project defaults, **preserving
@@ -25,10 +26,7 @@ use std::time::Duration;
 
 use crate::bake::{self, BakeError, ParsedAssetType, ParsedEntry};
 use crate::query;
-use crate::store::{
-    self, AssetDb, AssetEntry, AssetType, BakeCache, CachedAssetType, CachedEntry, LockWait,
-    StoreError,
-};
+use crate::store::{self, AssetDb, AssetEntry, AssetType, LockWait, StoreError};
 
 /// Unity importer kind. Each variant maps to the YAML block key (e.g.
 /// `NativeFormat` → `NativeFormatImporter:`). Extension → kind mapping
@@ -276,9 +274,10 @@ pub fn register(opts: &RegisterOptions) -> Result<RegisterOutcome, RegisterError
 /// fall back to parsing the existing meta. Sidesteps the TOCTOU window
 /// between `exists()` and `write()`.
 ///
-/// Write order: meta → bin → cache. A failure between meta-create and
-/// db-write leaves a meta on disk that isn't yet indexed; a re-run of
-/// register sees the existing meta and inserts the missing row.
+/// Write order: meta → bin. A failure between meta-create and
+/// db-write leaves a meta on disk that isn't yet indexed; the next
+/// query's auto-refresh ([[refresh.md]]) picks it up via Watchman, and
+/// a re-run of register is idempotent on the existing meta.
 fn synthesize_or_read_meta(
     target_abs: &Path,
     meta_path: &Path,
@@ -364,8 +363,13 @@ fn detect_importer_key(text: &str) -> Option<&str> {
 }
 
 /// Load `asset-db.bin` (empty if absent), re-parse via `bake::parse_one`,
-/// insert sorted, write both bin and cache atomically. Returns whether
-/// the db was actually modified.
+/// insert sorted, write the bin. Returns whether the db was actually
+/// modified.
+///
+/// Does NOT touch the Watchman clock. The next [`crate::refresh::refresh`]
+/// call asks Watchman for changes since the bin's clock and picks up
+/// the register-inserted row as part of the steady-state delta. Bumping
+/// the clock here would mask any unrelated edits Watchman has buffered.
 fn update_db_for(
     project_root: &Path,
     out_dir: &Path,
@@ -373,10 +377,8 @@ fn update_db_for(
     scrub_chars: Option<&str>,
 ) -> Result<bool, RegisterError> {
     let db_path = store::db_path(out_dir);
-    let cache_path = store::cache_path(out_dir);
 
     let mut db = read_or_empty_db(&db_path)?;
-    let mut cache = read_or_empty_cache(&cache_path)?;
 
     let Some(mut parsed) = bake::parse_one(project_root, meta_path)? else {
         return Ok(false);
@@ -390,18 +392,12 @@ fn update_db_for(
         guid,
         asset_type: parsed_at,
         hint,
-        meta_mtime_ns,
-        asset_mtime_ns,
         sub_assets,
     } = parsed;
     // Mint the always-ext alias the next full bake would derive — keeps
     // register-inserted rows from churning on the following `bake`.
     let name = bake::filename_with_ext_from_hint(&hint);
 
-    let cached_asset_type = match parsed_at {
-        ParsedAssetType::Native(n) => CachedAssetType::Native(n),
-        ParsedAssetType::Script(g) => CachedAssetType::Script(g),
-    };
     let asset_type = match parsed_at {
         ParsedAssetType::Native(n) => AssetType::Native(n),
         ParsedAssetType::Script(g) => AssetType::Script(db.intern_script(g)),
@@ -424,20 +420,11 @@ fn update_db_for(
         guid,
         asset_type,
         name: name.into_boxed_str(),
-        sub_assets: sub_assets.clone(),
-        hint: hint.clone().into_boxed_str(),
-    });
-    cache.insert_sorted(CachedEntry {
-        hint: hint.into_boxed_str(),
-        meta_mtime_ns,
-        asset_mtime_ns,
-        guid,
-        asset_type: cached_asset_type,
         sub_assets,
+        hint: hint.into_boxed_str(),
     });
 
     store::write(&db_path, &db)?;
-    store::write_cache(&cache_path, &cache)?;
     Ok(true)
 }
 
@@ -448,19 +435,6 @@ fn read_or_empty_db(path: &Path) -> Result<AssetDb, RegisterError> {
             Ok(AssetDb::new())
         }
         Err(e) => Err(e.into()),
-    }
-}
-
-fn read_or_empty_cache(path: &Path) -> Result<BakeCache, RegisterError> {
-    match store::read_cache(path) {
-        Ok(c) => Ok(c),
-        Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(BakeCache::new())
-        }
-        // Corrupt cache: re-build from scratch. The cache is gitignored
-        // and the next bake will refill it; throwing here would block
-        // register on an issue the user can't easily fix.
-        Err(_) => Ok(BakeCache::new()),
     }
 }
 

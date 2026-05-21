@@ -1,14 +1,12 @@
-//! On-disk schemas for the bake pipeline.
+//! On-disk schema for the convert artifact.
 //!
-//! Two files, written side-by-side under the consumer-chosen out-dir
-//! (commonly `<project>/Library/<consumer>/`):
+//! One file under the consumer-chosen out-dir (commonly
+//! `<project>/Library/<consumer>/`):
 //!
 //! - `asset-db.bin` — convert artifact. Lean: per-entry guid, asset type,
-//!   name, sub-assets. Sorted by guid for O(log n) binary-search lookup;
-//!   no path/mtime baggage.
-//! - `asset-db.cache.bin` — bake-only cache, gitignored alongside.
-//!   Maps `hint → (mtimes, resolved bake state)` so unchanged assets skip
-//!   re-parsing on subsequent bakes. Downstream consumers never read this.
+//!   name, sub-assets. Sorted by guid for O(log n) binary-search lookup.
+//!   Header carries an opaque Watchman clock token (see [[refresh.md]])
+//!   that drives incremental updates without a sidecar cache file.
 //!
 //! Script (MonoBehaviour / ScriptableObject) types are interned in
 //! `script_types` and referenced by index — keeps per-entry payload small
@@ -45,13 +43,16 @@ use crate::class_id::ClassId;
 ///   `.prefab` only). Pre-v6 caches carry leaked `'@<name>'` sub-asset
 ///   rows for child GOs that would re-emerge on warm bakes; the bump
 ///   invalidates them.
-pub const SCHEMA_VERSION: u16 = 6;
+/// - v7: mtime-based `asset-db.cache.bin` deleted. Cache invalidation
+///   moves to Watchman; an opaque clock token now lives in the `AssetDb`
+///   header (`watchman_clock: Option<String>`). The `CACHE_MAGIC`
+///   constant, `BakeCache`/`CachedEntry`/`CachedAssetType` types, and
+///   `{read,write,encode,decode}_cache` helpers are all gone. See
+///   [[refresh.md]] for the auto-refresh pipeline.
+pub const SCHEMA_VERSION: u16 = 7;
 
 /// File magic — first 8 bytes. `b"UADBIN__"`.
 pub const MAGIC: [u8; 8] = *b"UADBIN__";
-
-/// File magic for the bake-only cache file.
-pub const CACHE_MAGIC: [u8; 8] = *b"UADCACHE";
 
 /// Type of a Unity asset.
 ///
@@ -118,6 +119,16 @@ pub struct AssetEntry {
 #[derive(Debug, Clone, Default, Encode, Decode)]
 pub struct AssetDb {
     pub schema_version: u16,
+    /// Opaque Watchman clock token from the bake/refresh that produced
+    /// this `entries` snapshot. `None` means "never refreshed by
+    /// Watchman" (first-ever full bake on this machine, Watchman absent,
+    /// or a non-Watchman code path wrote the bin). The next call to
+    /// [`crate::refresh::refresh`] treats `None` exactly like a
+    /// `Fresh` reply from Watchman: full-bake to seed a clock.
+    ///
+    /// Kept opaque per the Watchman protocol — we never parse the
+    /// inside. See [docs/refresh.md](../../docs/refresh.md).
+    pub watchman_clock: Option<String>,
     /// Interned script GUIDs (u128). `AssetType::Script(idx)` indexes here.
     /// Sorted ascending; deduplicated.
     pub script_types: Vec<u128>,
@@ -196,71 +207,10 @@ impl AssetDb {
     }
 }
 
-// ─── Bake-only cache ─────────────────────────────────────────────────────
-
-/// `AssetType` variant for the cache. Stores the script GUID directly so
-/// the cache doesn't depend on the in-memory `script_types` table — each
-/// bake interns scripts fresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
-pub enum CachedAssetType {
-    Native(u32),
-    Script(u128),
-}
-
-/// One cached parse result, keyed by `hint`. Lets a re-bake skip the
-/// .meta + asset reads when the meta mtime matches.
-///
-/// `asset_mtime_ns` is recorded but no longer participates in the warm
-/// fast-path invalidation check — `process_one` keys solely on
-/// `meta_mtime_ns`. The field is retained for forensic value (a future
-/// re-bake or external tooling can compare against the live asset
-/// mtime) and as a schema slot for richer invalidation logic should it
-/// land. The implication: under hand-edits that touch the asset
-/// without touching the .meta, this field can become stale on the
-/// next re-bake (still serves the cached row). See
-/// `tests/bake.rs::cache_does_not_detect_asset_only_touch`.
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct CachedEntry {
-    pub hint: Box<str>,
-    pub meta_mtime_ns: u64,
-    pub asset_mtime_ns: u64,
-    pub guid: u128,
-    pub asset_type: CachedAssetType,
-    pub sub_assets: Vec<SubAsset>,
-}
-
-/// Bake-only cache file envelope. `entries` order is hint-sorted so re-writes
-/// are deterministic, but lookups go through a HashMap built at load.
-#[derive(Debug, Clone, Default, Encode, Decode)]
-pub struct BakeCache {
-    pub schema_version: u16,
-    pub entries: Vec<CachedEntry>,
-}
-
-impl BakeCache {
-    pub fn new() -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            ..Default::default()
-        }
-    }
-
-    /// Binary-search insert by hint; overwrites on collision.
-    pub fn insert_sorted(&mut self, entry: CachedEntry) {
-        match self.entries.binary_search_by(|e| e.hint.cmp(&entry.hint)) {
-            Ok(idx) => self.entries[idx] = entry,
-            Err(idx) => self.entries.insert(idx, entry),
-        }
-    }
-}
-
 // ─── Path helpers ────────────────────────────────────────────────────────
 
 /// Convert artifact filename.
 pub const DB_FILENAME: &str = "asset-db.bin";
-
-/// Bake-only mtime cache filename. Sibling to [`DB_FILENAME`].
-pub const CACHE_FILENAME: &str = "asset-db.cache.bin";
 
 /// Advisory-lock filename. `bake` and `register` flock this to serialize
 /// db rewrites — registration of a new asset must not race a parallel
@@ -271,11 +221,6 @@ pub const LOCK_FILENAME: &str = ".asset-db.lock";
 /// (e.g. `<project>/Library/unity-assetdb/`).
 pub fn db_path(dir: &Path) -> PathBuf {
     dir.join(DB_FILENAME)
-}
-
-/// `<dir>/asset-db.cache.bin`. Sibling to [`db_path`].
-pub fn cache_path(dir: &Path) -> PathBuf {
-    dir.join(CACHE_FILENAME)
 }
 
 /// `<dir>/.asset-db.lock`. Sibling to [`db_path`].
@@ -423,39 +368,6 @@ pub fn encode(db: &AssetDb) -> Result<Vec<u8>, StoreError> {
     encode_with_magic(db, MAGIC)
 }
 
-/// Read the bake-only cache. Caller decides what to do on error —
-/// the bake treats any error here as "no cache, parse from scratch".
-pub fn read_cache(path: &Path) -> Result<BakeCache, StoreError> {
-    let bytes = std::fs::read(path).map_err(|source| StoreError::Io {
-        op: "read cache",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    decode_cache(&bytes)
-}
-
-pub fn decode_cache(bytes: &[u8]) -> Result<BakeCache, StoreError> {
-    let body = check_magic(bytes, CACHE_MAGIC, "asset-db.cache")?;
-    let cfg = bincode::config::standard();
-    let (cache, _): (BakeCache, _) = bincode::decode_from_slice(body, cfg)?;
-    if cache.schema_version != SCHEMA_VERSION {
-        return Err(StoreError::SchemaMismatch {
-            label: "asset-db.cache",
-            found: cache.schema_version,
-            expected: SCHEMA_VERSION,
-        });
-    }
-    Ok(cache)
-}
-
-pub fn write_cache(path: &Path, cache: &BakeCache) -> Result<(), StoreError> {
-    write_bytes(path, &encode_cache(cache)?)
-}
-
-pub fn encode_cache(cache: &BakeCache) -> Result<Vec<u8>, StoreError> {
-    encode_with_magic(cache, CACHE_MAGIC)
-}
-
 fn encode_with_magic<T: Encode>(value: &T, magic: [u8; 8]) -> Result<Vec<u8>, StoreError> {
     let cfg = bincode::config::standard();
     let body = bincode::encode_to_vec(value, cfg)?;
@@ -582,45 +494,22 @@ mod tests {
         assert!(decode(&bad).is_err());
     }
 
+    /// Round-trip of the new `watchman_clock` header field. The clock
+    /// is opaque per the Watchman protocol — we only verify equality.
+    /// Specifically pins that an `Option<String>` round-trips with both
+    /// `Some` and `None`, since bincode's representation differs.
     #[test]
-    fn cache_roundtrip() {
-        let mut c = BakeCache::new();
-        c.entries.push(CachedEntry {
-            hint: "UI/Foo.prefab".into(),
-            meta_mtime_ns: 1,
-            asset_mtime_ns: 2,
-            guid: 0xaa_u128,
-            asset_type: CachedAssetType::Native(1001),
-            sub_assets: vec![],
-        });
-        c.entries.push(CachedEntry {
-            hint: "Tween/Bar.asset".into(),
-            meta_mtime_ns: 3,
-            asset_mtime_ns: 4,
-            guid: 0xbb_u128,
-            asset_type: CachedAssetType::Script(0xcc_u128),
-            sub_assets: vec![],
-        });
+    fn watchman_clock_round_trips() {
+        let mut db = AssetDb::new();
+        db.watchman_clock = Some("c:1789432100:42:1:7".to_owned());
+        let bytes = encode(&db).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.watchman_clock.as_deref(), Some("c:1789432100:42:1:7"));
 
-        let bytes = encode_cache(&c).unwrap();
-        let back = decode_cache(&bytes).unwrap();
-        assert_eq!(back.entries.len(), 2);
-        assert_eq!(
-            back.entries[1].asset_type,
-            CachedAssetType::Script(0xcc_u128)
-        );
-    }
-
-    #[test]
-    fn cache_magic_distinct_from_db() {
-        // Cache file must not be mistaken for db (and vice versa).
-        let c = BakeCache::new();
-        let cache_bytes = encode_cache(&c).unwrap();
-        assert!(decode(&cache_bytes).is_err());
-
-        let db = AssetDb::new();
-        let db_bytes = encode(&db).unwrap();
-        assert!(decode_cache(&db_bytes).is_err());
+        let none_db = AssetDb::new();
+        let bytes = encode(&none_db).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.watchman_clock, None);
     }
 
     /// Schema version is bumped on every breaking layout change. A
@@ -649,18 +538,6 @@ mod tests {
         let bytes = encode(&db).unwrap();
         let err = decode(&bytes).unwrap_err().to_string();
         assert!(err.contains("schema"), "expected schema-version error, got: {err}");
-    }
-
-    /// Cache schema mismatch is detected the same way — a v5 cache
-    /// against a v6 reader must trip the error path so the bake
-    /// rebuilds the cache from scratch instead of serving stale rows.
-    #[test]
-    fn cache_schema_version_mismatch_hard_fails() {
-        let mut c = BakeCache::new();
-        c.schema_version = SCHEMA_VERSION.saturating_sub(1);
-        let bytes = encode_cache(&c).unwrap();
-        let err = decode_cache(&bytes).unwrap_err().to_string();
-        assert!(err.contains("schema"), "expected schema mismatch, got: {err}");
     }
 
     /// `SubAsset.class_id` is a v5+ field. Pin that a round-trip

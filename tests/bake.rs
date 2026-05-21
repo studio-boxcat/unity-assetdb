@@ -32,10 +32,6 @@ fn db_file(root: &Path) -> PathBuf {
     store::db_path(&out_dir_for(root))
 }
 
-fn cache_file(root: &Path) -> PathBuf {
-    store::cache_path(&out_dir_for(root))
-}
-
 fn write(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -178,8 +174,8 @@ fn bake_then_load_roundtrip() {
 }
 
 #[test]
-fn cache_reuse_preserves_names() {
-    let root = unique_tmp("cache");
+fn rebake_preserves_names() {
+    let root = unique_tmp("rebake-names");
     let _ = fs::remove_dir_all(&root);
     make_fixture(&root);
 
@@ -201,31 +197,29 @@ fn cache_reuse_preserves_names() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// Pin: warm-bake hint integrity. `build_cache` leaves `RawEntry.hint`
-/// empty on the cached value and `process_one` re-stamps it from the
-/// HashMap key on a cache hit — one fewer allocation per warm hit. If
-/// either side regresses, the post-warm asset-db.bin carries
-/// empty/wrong hints. Asserts every entry's hint matches the source
-/// fixture path AND survives an arbitrary number of warm rebakes.
+/// Pin: re-bake hint integrity. Every entry's hint must be non-empty
+/// AND stable across repeated bakes. Asserts every entry's hint
+/// matches the source fixture path on the cold pass and survives an
+/// arbitrary number of subsequent rebakes.
 #[test]
-fn cache_hit_preserves_hint() {
-    let root = unique_tmp("cache-hint");
+fn rebake_preserves_hint() {
+    let root = unique_tmp("rebake-hint");
     let _ = fs::remove_dir_all(&root);
     make_fixture(&root);
 
-    // Cold bake builds the cache.
+    // First bake.
     let _out_dir = bake_at(&root);
     let cold = store::read(&db_file(&root)).unwrap();
 
-    // Three warm bakes — every hint must be non-empty and stable.
+    // Three re-bakes — every hint must be non-empty and stable.
     for _ in 0..3 {
         let _out_dir = bake_at(&root);
         let warm = store::read(&db_file(&root)).unwrap();
         assert_eq!(cold.entries.len(), warm.entries.len());
         for (c, w) in cold.entries.iter().zip(warm.entries.iter()) {
             assert_eq!(c.guid, w.guid);
-            assert!(!w.hint.is_empty(), "warm-bake hint went empty for guid {:032x}", w.guid);
-            assert_eq!(&*c.hint, &*w.hint, "warm-bake hint drifted for guid {:032x}", w.guid);
+            assert!(!w.hint.is_empty(), "re-bake hint went empty for guid {:032x}", w.guid);
+            assert_eq!(&*c.hint, &*w.hint, "re-bake hint drifted for guid {:032x}", w.guid);
         }
     }
 
@@ -292,14 +286,11 @@ fn prepass_walker_idempotent_and_descends_subdirs() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// Pin: cache→bin round-trip preserves sub_asset rows verbatim. The
-/// `build_cache` refactor stripped `hint` from the cached RawEntry but
-/// must leave every other field (guid, asset_type, sub_assets) intact.
-/// A regression that nulled sub_assets would silently drop sprite-sheet
-/// rows on warm bakes.
+/// Pin: re-bake preserves sub_asset rows verbatim. A regression that
+/// nulled sub_assets would silently drop sprite-sheet rows.
 #[test]
-fn cache_round_trips_sub_assets() {
-    let root = unique_tmp("cache-subassets");
+fn rebake_round_trips_sub_assets() {
+    let root = unique_tmp("rebake-subassets");
     let _ = fs::remove_dir_all(&root);
     make_fixture(&root);
 
@@ -310,7 +301,7 @@ fn cache_round_trips_sub_assets() {
         .entries
         .iter()
         .find(|e| e.guid == 0xdddd4444dddd4444dddd4444dddd4444_u128)
-        .expect("Sheet.png missing from cold bake");
+        .expect("Sheet.png missing from first bake");
     assert_eq!(
         cold_sheet.sub_assets.len(),
         2,
@@ -318,13 +309,13 @@ fn cache_round_trips_sub_assets() {
         cold_sheet.sub_assets,
     );
 
-    let _out_dir = bake_at(&root); // warm
+    let _out_dir = bake_at(&root); // re-bake
     let warm = store::read(&db_file(&root)).unwrap();
     let warm_sheet = warm
         .entries
         .iter()
         .find(|e| e.guid == 0xdddd4444dddd4444dddd4444dddd4444_u128)
-        .expect("Sheet.png missing from warm bake");
+        .expect("Sheet.png missing from re-bake");
     assert_eq!(warm_sheet.sub_assets.len(), 2);
     for (c, w) in cold_sheet.sub_assets.iter().zip(warm_sheet.sub_assets.iter()) {
         assert_eq!(c.file_id, w.file_id);
@@ -496,147 +487,51 @@ DefaultImporter:
     fs::remove_dir_all(&root).ok();
 }
 
-/// Cache integrity: when neither the `.meta` nor the asset file mtime
-/// changed between bakes, the second bake reuses cached entries
-/// verbatim and produces a byte-identical `asset-db.bin`. Pins the
-/// fast-path that skips the asset stat when the `.meta` mtime matches.
+/// Re-bake determinism: when nothing on disk changed between bakes,
+/// the resulting `entries` + `script_types` are structurally identical.
+/// Pins dedup-stable ordering + script-intern determinism. The
+/// `watchman_clock` header field is *expected* to drift between bakes
+/// (Watchman returns a new monotonic clock each call), so we compare
+/// the data fields only.
 #[test]
-fn cache_hit_path_byte_identical_rebake() {
-    let root = unique_tmp("cache-hit-bytes");
+fn rebake_is_data_identical() {
+    let root = unique_tmp("rebake-data");
     let _ = fs::remove_dir_all(&root);
     make_fixture(&root);
 
     let _out_dir = bake_at(&root);
-    let first = fs::read(db_file(&root)).unwrap();
+    let first = store::read(&db_file(&root)).unwrap();
 
-    // Sleep ≥1ms so any spurious mtime-on-touch debug couldn't false-hit.
-    // We don't TOUCH anything, but we also don't want to mask a bug where
-    // bake re-stamps an mtime as a side-effect.
     std::thread::sleep(std::time::Duration::from_millis(5));
 
     let _out_dir = bake_at(&root);
-    let second = fs::read(db_file(&root)).unwrap();
+    let second = store::read(&db_file(&root)).unwrap();
 
-    assert_eq!(first, second, "second-bake bytes drifted from first");
+    assert_eq!(first.schema_version, second.schema_version);
+    assert_eq!(first.script_types, second.script_types);
+    assert_eq!(first.entries.len(), second.entries.len());
+    for (a, b) in first.entries.iter().zip(second.entries.iter()) {
+        assert_eq!(a.guid, b.guid);
+        assert_eq!(a.asset_type, b.asset_type);
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.hint, b.hint);
+        assert_eq!(a.sub_assets.len(), b.sub_assets.len());
+        for (sa, sb) in a.sub_assets.iter().zip(b.sub_assets.iter()) {
+            assert_eq!(sa.file_id, sb.file_id);
+            assert_eq!(sa.class_id, sb.class_id);
+            assert_eq!(sa.name, sb.name);
+        }
+    }
     fs::remove_dir_all(&root).ok();
 }
 
-/// Cache trade-off: pinning the warm-path assumption. Touching only
-/// the asset file (without touching its `.meta`) does NOT invalidate the
-/// cache — the fast path keys on `.meta` mtime alone. Under Unity's
-/// importer this never happens (it stamps the `.meta` on every import),
-/// so the cached row stays correct in practice. Out-of-Unity asset
-/// edits land in the asset DB on the next `.meta` touch (or a manual
-/// `rm asset-db.cache.bin`).
-///
-/// Documented assumption in `process_one`; test pins the current
-/// behavior so any future invariant flip surfaces here.
+/// Deleting an asset between bakes drops it from the resulting database.
+/// Now that warm bakes always re-walk (Watchman-driven incremental
+/// updates supersede the old mtime cache), this is a straight full-bake
+/// round-trip — no cache fast-path to interfere.
 #[test]
-fn cache_does_not_detect_asset_only_touch() {
-    let root = unique_tmp("cache-asset-only-touch");
-    let _ = fs::remove_dir_all(&root);
-    make_fixture(&root);
-
-    let _out_dir = bake_at(&root);
-    let asset_path = root.join("Assets/UI/Foo.prefab");
-    let pre_meta_mtime = mtime_ns_of(&root.join("Assets/UI/Foo.prefab.meta"));
-
-    // Touch only the asset (Unity workflow can never produce this).
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let now = filetime::FileTime::now();
-    set_mtime(&asset_path, now);
-
-    let _out_dir = bake_at(&root);
-    let c = store::read_cache(&cache_file(&root)).unwrap();
-    let foo = c
-        .entries
-        .iter()
-        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
-        .unwrap();
-    // The cache's recorded asset_mtime is the *original* — fast path
-    // bypassed the companion stat, so the bake never noticed the touch.
-    assert_ne!(
-        foo.asset_mtime_ns,
-        mtime_ns_of(&asset_path),
-        "asset-only touch was unexpectedly detected (fast path may have changed)"
-    );
-    // Sanity: the meta mtime IS the value we'd expect (unchanged across
-    // bakes), confirming the fast path actually fired.
-    assert_eq!(
-        foo.meta_mtime_ns, pre_meta_mtime,
-        "meta mtime drifted between bakes — fixture leaked",
-    );
-    fs::remove_dir_all(&root).ok();
-}
-
-/// Cache integrity: when both `.meta` and asset get touched (normal
-/// Unity reimport pattern), the second bake re-parses and the cache
-/// records the fresh mtimes. The most common warm-bake-invalidation
-/// case in practice.
-#[test]
-fn cache_invalidates_on_meta_and_asset_touch() {
-    let root = unique_tmp("cache-both-touch");
-    let _ = fs::remove_dir_all(&root);
-    make_fixture(&root);
-
-    let _out_dir = bake_at(&root);
-    let meta_path = root.join("Assets/UI/Foo.prefab.meta");
-    let asset_path = root.join("Assets/UI/Foo.prefab");
-
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let now = filetime::FileTime::now();
-    set_mtime(&meta_path, now);
-    set_mtime(&asset_path, now);
-
-    let _out_dir = bake_at(&root);
-    let c = store::read_cache(&cache_file(&root)).unwrap();
-    let foo = c
-        .entries
-        .iter()
-        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
-        .unwrap();
-    assert_eq!(foo.meta_mtime_ns, mtime_ns_of(&meta_path));
-    assert_eq!(foo.asset_mtime_ns, mtime_ns_of(&asset_path));
-    fs::remove_dir_all(&root).ok();
-}
-
-/// Cache integrity: changing the `.meta` mtime alone (without asset
-/// edits) must still cause re-parse — the meta stat is what gates the
-/// fast path, so a drift there has to fall through to the slow path.
-#[test]
-fn cache_invalidates_on_meta_mtime_drift() {
-    let root = unique_tmp("cache-meta-drift");
-    let _ = fs::remove_dir_all(&root);
-    make_fixture(&root);
-
-    let _out_dir = bake_at(&root);
-
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let meta_path = root.join("Assets/UI/Foo.prefab.meta");
-    let now = filetime::FileTime::now();
-    set_mtime(&meta_path, now);
-
-    let _out_dir = bake_at(&root);
-    let c = store::read_cache(&cache_file(&root)).unwrap();
-    let foo = c
-        .entries
-        .iter()
-        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
-        .unwrap();
-    let new_meta_mtime = mtime_ns_of(&meta_path);
-    assert_eq!(
-        foo.meta_mtime_ns, new_meta_mtime,
-        "cache meta_mtime not bumped after meta touch"
-    );
-    fs::remove_dir_all(&root).ok();
-}
-
-/// Cache integrity: deleting an asset between bakes drops it from the
-/// resulting database. Guards against a fast-path bug that might serve
-/// the cached row even when the companion no longer exists.
-#[test]
-fn cache_drops_entry_when_asset_deleted() {
-    let root = unique_tmp("cache-asset-deleted");
+fn rebake_drops_entry_when_asset_deleted() {
+    let root = unique_tmp("rebake-asset-deleted");
     let _ = fs::remove_dir_all(&root);
     make_fixture(&root);
 
@@ -663,10 +558,6 @@ fn cache_drops_entry_when_asset_deleted() {
     fs::remove_dir_all(&root).ok();
 }
 
-fn set_mtime(path: &Path, t: filetime::FileTime) {
-    filetime::set_file_mtime(path, t).unwrap();
-}
-
 fn mtime_ns_of(path: &Path) -> u64 {
     let md = fs::metadata(path).unwrap();
     let st = md
@@ -675,38 +566,6 @@ fn mtime_ns_of(path: &Path) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     st.as_nanos() as u64
-}
-
-/// A corrupt `asset-db.cache.bin` (wrong magic, truncated bytes, schema
-/// drift, …) must NOT crash the bake. The bake's contract is "rebuild
-/// from scratch if the cache is unreadable" — guards against a hand-
-/// edited cache file or a half-written one from a kill -9'd bake.
-#[test]
-fn bake_recovers_from_corrupt_cache() {
-    let root = unique_tmp("corrupt-cache");
-    let _ = fs::remove_dir_all(&root);
-    make_fixture(&root);
-
-    // First bake → produces a real cache file.
-    let _out_dir = bake_at(&root);
-    let cache_path = cache_file(&root);
-    assert!(cache_path.exists());
-
-    // Corrupt it: replace contents with garbage. The bake-side decode
-    // hits a magic mismatch / decode error and falls back to "empty
-    // cache" path.
-    fs::write(&cache_path, b"this is not a valid cache file").unwrap();
-
-    // Should not panic; should produce a correct asset-db.bin.
-    let _out_dir = bake_at(&root);
-    let db = store::read(&db_file(&root)).unwrap();
-    assert_eq!(
-        db.entries.len(),
-        3,
-        "bake recovered, but entry count drifted: {}",
-        db.entries.len(),
-    );
-    fs::remove_dir_all(&root).ok();
 }
 
 /// Zero-asset-but-valid-project: a Unity project with `Assets/` +
@@ -1153,35 +1012,6 @@ fn bake_does_not_synthesize_inside_git_submodules() {
             "synthesis must skip {skipped} (inside submodule)",
         );
     }
-
-    fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn cache_file_lives_alongside_bin() {
-    let root = unique_tmp("cache-file");
-    let _ = fs::remove_dir_all(&root);
-    make_fixture(&root);
-
-    let _out_dir = bake_at(&root);
-    let cache = cache_file(&root);
-    assert!(
-        cache.exists(),
-        "cache file not created at {}",
-        cache.display()
-    );
-
-    // Cache stores hints + mtimes; convert artifact does not.
-    let c = store::read_cache(&cache).unwrap();
-    assert_eq!(c.entries.len(), 3);
-    // Hints are project-root-relative so Assets/ and Packages/ share one scheme.
-    let foo = c
-        .entries
-        .iter()
-        .find(|e| &*e.hint == "Assets/UI/Foo.prefab")
-        .unwrap();
-    assert!(foo.meta_mtime_ns > 0);
-    assert!(foo.asset_mtime_ns > 0);
 
     fs::remove_dir_all(&root).ok();
 }

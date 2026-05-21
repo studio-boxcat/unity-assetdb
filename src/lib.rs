@@ -11,7 +11,9 @@
 //! - [`meta`] — `.meta` parser.
 //! - [`asset`] — asset YAML parser.
 //! - [`walk`] — project-root resolver + parallel walker.
-//! - [`bake`] — orchestrator (`BakeOptions`, `bake`, `parse_one`).
+//! - [`bake`] — full-bake orchestrator (`BakeOptions`, `bake`, `parse_one`).
+//! - [`watch`] — Watchman wire layer (`since`, `Delta`, `WatchError`).
+//! - [`refresh`] — auto-refresh orchestrator: watch::since → patch | full-bake.
 //! - [`query`] — read-only lookups against a baked `asset-db.bin`.
 //! - [`register`] — synthesize a `.meta` outside Unity, incremental db insert.
 //! - [`suggest`] — fuzzy "did you mean" helper used by the query CLI.
@@ -22,8 +24,13 @@ pub mod bake;
 pub mod class_id;
 pub mod meta;
 pub mod query;
+pub mod refresh;
 pub mod register;
 pub mod store;
 pub mod suggest;
 pub mod usage;
 pub mod walk;
+pub mod watch;
+
+#[cfg(test)]
+pub(crate) mod test_support;

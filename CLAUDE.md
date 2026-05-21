@@ -1,8 +1,9 @@
 # unity-assetdb
 
 > **Related:** [`docs/asset-database.md`](docs/asset-database.md) (storage
-> schema + bake pipeline) · [`docs/profiling.md`](docs/profiling.md) (wall-
-> clock baselines + samply recipe).
+> schema + bake pipeline) · [`docs/refresh.md`](docs/refresh.md) (Watchman-
+> driven incremental refresh) · [`docs/profiling.md`](docs/profiling.md)
+> (wall-clock baselines + samply recipe).
 
 Walks a Unity project's `Assets/` tree, parses `.meta` and asset YAML, and writes a
 compact bincode index that maps asset GUIDs (and sub-asset fileIDs) to human-readable
@@ -28,12 +29,18 @@ query pipeline below). One sub-crate lives under `crates/`:
 
 ## Crate layout
 
-- `store` — on-disk schema (`AssetDb`, `AssetEntry`, `SubAsset`, `AssetType`).
+- `store` — on-disk schema (`AssetDb` with `watchman_clock` header,
+  `AssetEntry`, `SubAsset`, `AssetType`).
 - `class_id` — Unity classID enum (`Sprite=213`, `Prefab=1001`, …).
 - `meta` — `.meta` parser (top-level GUID, sprite-sheet sub-assets, importer fields).
 - `asset` — asset YAML parser (top class ID, `m_Script.guid`, sub-doc enumeration).
 - `walk` — project-root resolver + parallel `Assets/` walker.
-- `bake` — orchestrator (`BakeOptions`, `bake`, `parse_one`).
+- `bake` — full-bake orchestrator (`BakeOptions`, `bake`, `parse_one`).
+- `watch` — Watchman wire layer (`since`, `Delta`, `WatchError`). Sync
+  facade over `watchman_client`'s tokio API.
+- `refresh` — auto-refresh: `watch::since` → patch in place / clock-only
+  update / full bake on fresh_instance / no-op nudge if Watchman is
+  absent. Every CLI query subcommand goes through this.
 - `query` — read-only lookups against a baked `asset-db.bin` (`guid_of_path`,
   `path_of_guid`, `find`, `find_by_hint`, `list`, `alias`).
 - `register` — synthesize a minimal `.meta` outside Unity, incremental
@@ -72,11 +79,29 @@ unity-assetdb register <path> [--type <importer>] [--scrub-chars <c>] [--lock-ti
 Without `--project`, walks up from the cwd until both `Assets/` and `ProjectSettings/`
 are found. Without `--out-dir`, writes to `<project>/Library/unity-assetdb/`.
 
+**Auto-refresh.** Every query subcommand transparently refreshes the bin
+via [Watchman](docs/refresh.md) before serving its answer. Branches:
+
+- bin missing / unreadable / schema-mismatched → full bake.
+- Watchman delta empty → no-op (bin already current).
+- Watchman delta small → patch in place.
+- Watchman delta huge / `fresh_instance` → full bake.
+- Watchman unreachable → full bake + one-line stderr nudge
+  (`brew install watchman`).
+
+If the project relies on a scrub policy, run `bake --scrub-chars` once
+explicitly so the index round-trips with `alias`/`register`.
+
 Output discipline: data → stdout, warnings / suggestions / progress → stderr.
 TSV cells escape `\t`/`\n`/`\\`. JSON output is one object per line.
 
-`bake` and `register` share an advisory flock on `<out_dir>/.asset-db.lock`
-to keep the bin coherent under concurrent invocations.
+`bake` and `register` share an advisory flock on
+`<out_dir>/.asset-db.lock` so concurrent writers don't clobber the
+bin. `refresh::refresh` deliberately skips the flock on the patch
+path — a lost-update race between concurrent refreshes converges on
+the next query via Watchman replay, and the simpler unlocked path
+wins. (See [`refresh.md`](docs/refresh.md) and the comment in
+`bake_inner` for the deadlock breadcrumb.)
 
 ## Profiling
 

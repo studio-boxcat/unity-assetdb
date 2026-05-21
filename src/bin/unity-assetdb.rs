@@ -24,9 +24,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use unity_assetdb::bake::{BakeOptions, bake};
-use unity_assetdb::query::{self, AssetTypeFilter, parse_guid};
+use unity_assetdb::query::{self, AssetTypeFilter, QueryError, parse_guid};
+use unity_assetdb::refresh;
 use unity_assetdb::register::{ImporterKind, RegisterOptions, register};
-use unity_assetdb::store::{AssetDb, AssetEntry};
+use unity_assetdb::store::{self, AssetDb, AssetEntry};
 use unity_assetdb::suggest::suggest;
 use unity_assetdb::usage::{self, UsageMatch};
 use unity_assetdb::walk::resolve_project_root;
@@ -44,7 +45,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Walk Assets/, write `<out_dir>/asset-db.bin` (mtime-cached re-bake).
+    /// Walk Assets/, write `<out_dir>/asset-db.bin`. Use when you want
+    /// an unconditional full rebuild — every query subcommand
+    /// auto-refreshes via Watchman, so explicit `bake` is mostly for
+    /// scripts / CI / forcing a re-walk after a schema change.
     Bake {
         #[command(flatten)]
         common: CommonOpts,
@@ -212,6 +216,21 @@ fn run(cmd: Commands) -> anyhow::Result<ExitCode> {
 
 fn run_bake(common: CommonOpts, scrub_chars: Option<String>) -> anyhow::Result<()> {
     let (project_root, out_dir) = resolve_paths(&common)?;
+    let opts = build_bake_opts(project_root, out_dir, scrub_chars);
+    bake(&opts)?;
+    Ok(())
+}
+
+/// Build [`BakeOptions`] honoring env-var verbosity knobs. Shared by the
+/// explicit `bake` subcommand and the query auto-bake path; the latter
+/// always passes `scrub_chars = None` since query subcommands don't carry
+/// the flag (and an auto-baked index is a best-effort recovery — callers
+/// who rely on a scrub policy should still `bake --scrub-chars` once).
+fn build_bake_opts(
+    project_root: PathBuf,
+    out_dir: PathBuf,
+    scrub_chars: Option<String>,
+) -> BakeOptions {
     let verbose_timing = std::env::var("UNITY_ASSETDB_TIMING").is_ok();
     let verbose_collisions = std::env::var("UNITY_ASSETDB_VERBOSE").is_ok();
     let name_sanitizer = scrub_chars.map(|chars| {
@@ -220,7 +239,7 @@ fn run_bake(common: CommonOpts, scrub_chars: Option<String>) -> anyhow::Result<(
             Box::new(move |s: &str| scrub_chars_in(s, &scrub));
         sanitizer
     });
-    let opts = BakeOptions {
+    BakeOptions {
         project_root,
         out_dir,
         name_sanitizer,
@@ -228,9 +247,7 @@ fn run_bake(common: CommonOpts, scrub_chars: Option<String>) -> anyhow::Result<(
         on_progress: Some(Box::new(|m| eprintln!("{m}"))),
         verbose_timing,
         verbose_collisions,
-    };
-    bake(&opts)?;
-    Ok(())
+    }
 }
 
 /// Replace each `scrub` char in `name` with `_`. Returns `Some(rewritten)`
@@ -250,8 +267,7 @@ fn scrub_chars_in(name: &str, scrub: &[char]) -> Option<String> {
 // ─── query: guid / path / find / list / alias ────────────────────────────
 
 fn run_guid(common: CommonOpts, out: OutputOpts, path: &str) -> anyhow::Result<ExitCode> {
-    let out_dir = resolve_out_dir(&common)?;
-    let db = query::open(&out_dir)?;
+    let db = open_db_or_refresh(&common)?;
     // Exact hint hit → single row. Otherwise treat the arg as a
     // case-insensitive substring pattern on hints and list every match.
     let hits: Vec<&AssetEntry> = match query::guid_of_path(&db, path) {
@@ -272,8 +288,7 @@ fn run_guid(common: CommonOpts, out: OutputOpts, path: &str) -> anyhow::Result<E
 }
 
 fn run_path(common: CommonOpts, out: OutputOpts, guid_str: &str) -> anyhow::Result<ExitCode> {
-    let out_dir = resolve_out_dir(&common)?;
-    let db = query::open(&out_dir)?;
+    let db = open_db_or_refresh(&common)?;
     let guid = parse_guid(guid_str)?;
     if let Some(entry) = query::path_of_guid(&db, guid) {
         let stdout = std::io::stdout();
@@ -292,8 +307,7 @@ fn run_path(common: CommonOpts, out: OutputOpts, guid_str: &str) -> anyhow::Resu
 }
 
 fn run_find(common: CommonOpts, out: OutputOpts, pattern: &str) -> anyhow::Result<ExitCode> {
-    let out_dir = resolve_out_dir(&common)?;
-    let db = query::open(&out_dir)?;
+    let db = open_db_or_refresh(&common)?;
     let hits = query::find(&db, pattern);
     if hits.is_empty() {
         print_miss("name", pattern, db.entries.iter().map(|e| e.name.as_ref()));
@@ -314,8 +328,7 @@ fn run_list(
     out: OutputOpts,
     type_str: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
-    let out_dir = resolve_out_dir(&common)?;
-    let db = query::open(&out_dir)?;
+    let db = open_db_or_refresh(&common)?;
     let filter = match type_str {
         Some(s) => Some(AssetTypeFilter::parse(s)?),
         None => None,
@@ -334,8 +347,7 @@ fn run_alias(
     scrub_chars: Option<&str>,
     name: &str,
 ) -> anyhow::Result<ExitCode> {
-    let out_dir = resolve_out_dir(&common)?;
-    let db = query::open(&out_dir)?;
+    let db = open_db_or_refresh(&common)?;
     let hits = query::alias(&db, name, scrub_chars.unwrap_or(""));
     if hits.is_empty() {
         print_miss("alias", name, db.entries.iter().map(|e| e.name.as_ref()));
@@ -355,11 +367,11 @@ fn run_alias(
 /// anything else is looked up as a project-rel path against the baked
 /// index. Then walks the project for references to that GUID.
 fn run_usage(common: CommonOpts, out: OutputOpts, target: &str) -> anyhow::Result<ExitCode> {
-    let (project_root, out_dir) = resolve_paths(&common)?;
+    let (project_root, _out_dir) = resolve_paths(&common)?;
     let guid = if let Ok(g) = parse_guid(target) {
         g
     } else {
-        let db = query::open(&out_dir)?;
+        let db = open_db_or_refresh(&common)?;
         let Some(entry) = query::guid_of_path(&db, target) else {
             let needle = query::normalize_hint(target);
             print_miss("path", &needle, db.entries.iter().map(|e| e.hint.as_ref()));
@@ -442,16 +454,45 @@ fn resolve_paths(common: &CommonOpts) -> anyhow::Result<(PathBuf, PathBuf)> {
     Ok((project_root, out_dir))
 }
 
-/// Read-only variant of [`resolve_paths`] for query subcommands: when
-/// `--out-dir` is supplied explicitly, skip the project-root walk-up so
-/// queries work from any directory (e.g. running against a pre-baked
-/// `asset-db.bin` in an arbitrary location).
-fn resolve_out_dir(common: &CommonOpts) -> anyhow::Result<PathBuf> {
-    if let Some(out_dir) = common.out_dir.clone() {
-        return Ok(out_dir);
-    }
-    let project_root = resolve_project_root(common.project.as_deref())?;
-    Ok(project_root.join("Library").join("unity-assetdb"))
+/// Open `<out_dir>/asset-db.bin` for a query subcommand, auto-refreshing
+/// via Watchman before returning. The bin is always either freshly
+/// rebuilt, freshly patched, or had its clock advanced — never stale.
+///
+/// Lifecycle (matches `docs/refresh.md`):
+/// 1. Try to read the bin. *Any* `StoreError` (missing, schema mismatch,
+///    corruption) collapses to a full bake; the next query reads the
+///    rebuilt bin. This is the only "auto-recovery" path — if a future
+///    bake also fails, the error surfaces normally.
+/// 2. Read succeeded. Call `refresh::refresh` to apply Watchman delta
+///    (patch in place / clock-only update / full bake on fresh_instance
+///    / full bake on Watchman unavailability). Refresh writes the bin
+///    when it mutates anything; we re-read at the end to capture all
+///    surface bins, regardless of which branch fired.
+fn open_db_or_refresh(common: &CommonOpts) -> anyhow::Result<AssetDb> {
+    let (project_root, out_dir) = resolve_paths(common)?;
+    let mut db = match query::open(&out_dir) {
+        Ok(db) => db,
+        Err(QueryError::Store(_)) => {
+            // Missing, schema-mismatch, magic-mismatch, decode failure
+            // all collapse to "rebuild from scratch". Don't try to be
+            // clever — the bin is cheap to regenerate.
+            eprintln!(
+                "asset-db unreadable or missing at {}; running full bake...",
+                store::db_path(&out_dir).display()
+            );
+            let opts = build_bake_opts(project_root.clone(), out_dir.clone(), None);
+            bake(&opts)?;
+            return Ok(query::open(&out_dir)?);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Steady-state path. Refresh emits its own one-line stderr notice
+    // when Watchman is unavailable or the query errors; the warn sink
+    // routes those straight through.
+    let on_warn = |m: &str| eprintln!("{m}");
+    refresh::refresh(&mut db, &project_root, &out_dir, Some(&on_warn))?;
+    Ok(db)
 }
 
 /// Write one entry to `w` in TSV or JSON. Uses [`u128_hex`] instead of

@@ -1,21 +1,23 @@
-//! Bake orchestrator: walk → parse → cache → write.
+//! Bake orchestrator: walk → parse → write.
 //!
 //! Per-file flow:
-//! 1. Stat `.meta` and the companion asset file. If both mtimes match the
-//!    cached values → reuse cached entry, skip parse.
-//! 2. Else read `.meta` → guid + sprite-sheet sub-assets.
-//! 3. Read the asset file → top-level class ID + sub-asset rows.
-//! 4. Resolve `AssetType`: native `class_id` or `Script(script_guid)`.
-//! 5. Derive alias from the filename stem.
+//! 1. Read `.meta` → guid + sprite-sheet sub-assets.
+//! 2. Read the asset file → top-level class ID + sub-asset rows.
+//! 3. Resolve `AssetType`: native `class_id` or `Script(script_guid)`.
+//! 4. Derive alias from the filename stem.
 //!
 //! Post-walk: alias-collision sweep (filename stems can clash; we suffix
 //! with parent dir on conflict and warn).
+//!
+//! Note: the mtime-based `asset-db.cache.bin` was retired in schema v7
+//! (see `store.rs`). Cache invalidation moves to Watchman via
+//! [`crate::refresh`] + [`crate::watch`]; see `docs/refresh.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
 
@@ -24,10 +26,7 @@ use anyhow::{Context, Result};
 use crate::asset;
 use crate::class_id::{ClassId, class_from_ext};
 use crate::meta::{self, SPRITE_MODE_SINGLE, TEXTURE_TYPE_SPRITE};
-use crate::store::{
-    self, AssetDb, AssetEntry, AssetType, BakeCache, CachedAssetType, CachedEntry, StoreError,
-    SubAsset, CACHE_FILENAME, DB_FILENAME,
-};
+use crate::store::{self, AssetDb, AssetEntry, AssetType, StoreError, SubAsset, DB_FILENAME};
 use crate::query::format_guid;
 use crate::register::{generate_guid, importer_for_path, render_meta};
 use crate::walk::{walk_for_missing_meta, walk_meta_files, WalkError};
@@ -37,8 +36,8 @@ use crate::walk::{walk_for_missing_meta, walk_meta_files, WalkError};
 /// `Store(StoreError)` and `Walk(WalkError)` surface the typed source
 /// errors from those modules — match on them when you need to
 /// distinguish (e.g. "is this a schema-mismatch that needs re-bake?").
-/// `Other` carries the remaining anyhow-chained errors (cache I/O,
-/// dedup hard-fails, duplicate-guid checks) — most consumers propagate
+/// `Other` carries the remaining anyhow-chained errors (dedup
+/// hard-fails, duplicate-guid checks) — most consumers propagate
 /// these untouched.
 #[derive(Debug, thiserror::Error)]
 pub enum BakeError {
@@ -120,25 +119,16 @@ fn is_filterable_subdoc_for_ext(class_id: u32, ext: &str) -> bool {
     is_go_tree || (is_component && ext == "prefab")
 }
 
-/// Convert `SystemTime` → ns-since-UNIX. Saturates to 0 on pre-epoch
-/// (which would only happen if the user's clock is bogus).
-fn mtime_ns(t: SystemTime) -> u64 {
-    t.duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
-}
-
 /// One raw bake result, before name dedup. `script_guid` is the unmapped
 /// GUID for MonoBehaviour assets — interning happens after the walk so we
 /// only need one final sort.
 #[derive(Clone)]
-struct RawEntry {
-    guid: u128,
-    asset_type_raw: AssetTypeRaw,
-    hint: String,
-    name: String,
-    meta_mtime_ns: u64,
-    asset_mtime_ns: u64,
-    sub_assets: Vec<SubAsset>,
+pub(crate) struct RawEntry {
+    pub(crate) guid: u128,
+    pub(crate) asset_type_raw: AssetTypeRaw,
+    pub(crate) hint: String,
+    pub(crate) name: String,
+    pub(crate) sub_assets: Vec<SubAsset>,
 }
 
 /// Hashable type discriminator: `Native(classID)` for built-in classes
@@ -146,7 +136,7 @@ struct RawEntry {
 /// the dedup pass can bucket by `(name, asset_type)` without depending
 /// on the post-walk script-intern table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum AssetTypeRaw {
+pub(crate) enum AssetTypeRaw {
     Native(u32),
     Script(u128),
 }
@@ -159,8 +149,6 @@ pub struct ParsedEntry {
     pub guid: u128,
     pub asset_type: ParsedAssetType,
     pub hint: String,
-    pub meta_mtime_ns: u64,
-    pub asset_mtime_ns: u64,
     pub sub_assets: Vec<SubAsset>,
 }
 
@@ -192,10 +180,6 @@ impl Drop for ThreadLocal {
         let _ = self.err_tx.send(errors);
     }
 }
-
-/// Cache key: hint (Assets-relative, forward-slashed). ahash beats siphash
-/// by ~2x for our small-string keys.
-type CacheMap = AHashMap<String, RawEntry>;
 
 /// Run a `Result<Option<T>>`-producing closure under `catch_unwind` and
 /// flatten the four-way outcome (success-with-value / success-skip /
@@ -230,64 +214,6 @@ where
     }
 }
 
-/// Build the in-memory cache from a previously-saved `BakeCache`. Each
-/// `CachedEntry` becomes a `RawEntry` keyed by its hint. Cache hits during
-/// the walk drop straight into the post-walk pipeline.
-///
-/// `String::from(Box<str>)` is O(1) — Rust hands the heap allocation
-/// directly from the box to the new String, no copy. The map key is then
-/// cloned once for the parallel field on `RawEntry` (one alloc per entry).
-fn build_cache(cache: BakeCache) -> CacheMap {
-    let mut out = AHashMap::with_capacity(cache.entries.len());
-    for e in cache.entries {
-        let asset_type_raw = match e.asset_type {
-            CachedAssetType::Native(n) => AssetTypeRaw::Native(n),
-            CachedAssetType::Script(g) => AssetTypeRaw::Script(g),
-        };
-        // The HashMap key duplicates the value's hint. Storing the same
-        // string twice burns 18k extra allocations on a warm bake; instead,
-        // leave hint empty in the cached value and stamp it from the key
-        // when `process_one` clones the entry on a cache hit. RawEntry's
-        // hint field is the consumer of record.
-        let hint = String::from(e.hint);
-        let raw = RawEntry {
-            guid: e.guid,
-            asset_type_raw,
-            hint: String::new(),
-            name: String::new(),
-            meta_mtime_ns: e.meta_mtime_ns,
-            asset_mtime_ns: e.asset_mtime_ns,
-            sub_assets: e.sub_assets,
-        };
-        out.insert(hint, raw);
-    }
-    out
-}
-
-/// Build the on-disk cache from the post-walk raw entries. Sorted by hint
-/// so the file is byte-stable across re-bakes when nothing changed.
-fn build_bake_cache(raw: &[RawEntry]) -> BakeCache {
-    let mut entries: Vec<CachedEntry> = raw
-        .iter()
-        .map(|r| CachedEntry {
-            hint: r.hint.clone().into_boxed_str(),
-            meta_mtime_ns: r.meta_mtime_ns,
-            asset_mtime_ns: r.asset_mtime_ns,
-            guid: r.guid,
-            asset_type: match r.asset_type_raw {
-                AssetTypeRaw::Native(n) => CachedAssetType::Native(n),
-                AssetTypeRaw::Script(g) => CachedAssetType::Script(g),
-            },
-            sub_assets: r.sub_assets.clone(),
-        })
-        .collect();
-    entries.sort_by(|a, b| a.hint.cmp(&b.hint));
-    BakeCache {
-        schema_version: store::SCHEMA_VERSION,
-        entries,
-    }
-}
-
 /// Caller-supplied bake configuration.
 ///
 /// Built by the consumer's CLI / library entry point and handed to
@@ -299,9 +225,9 @@ pub struct BakeOptions {
     /// resolves this (typically via [`crate::walk::resolve_project_root`])
     /// before constructing options.
     pub project_root: PathBuf,
-    /// Directory where `asset-db.bin` and `asset-db.cache.bin` are written.
-    /// Caller composes the convention (e.g. `<project>/Library/unity-assetdb/`
-    /// or a fixture-staging path).
+    /// Directory where `asset-db.bin` is written. Caller composes the
+    /// convention (e.g. `<project>/Library/unity-assetdb/` or a
+    /// fixture-staging path).
     pub out_dir: PathBuf,
     /// Optional name sanitizer; see [`NameSanitizer`].
     pub name_sanitizer: Option<NameSanitizer>,
@@ -311,7 +237,7 @@ pub struct BakeOptions {
     /// summary line.
     pub on_progress: Option<ProgressSink>,
     /// When true, [`on_progress`] also receives a per-phase timing line
-    /// (cache / walk / build / write). Env-var-driven behavior is the
+    /// (prepass / walk / build / write). Env-var-driven behavior is the
     /// consumer's call.
     pub verbose_timing: bool,
     /// When true, [`on_warn`] receives a line for each name-collision
@@ -321,7 +247,12 @@ pub struct BakeOptions {
 }
 
 /// Bake entry-point. Walks `Assets/`, parses `.meta` + asset YAML,
-/// writes `<out_dir>/asset-db.bin` and `<out_dir>/asset-db.cache.bin`.
+/// captures a fresh Watchman clock (if available), writes
+/// `<out_dir>/asset-db.bin`.
+///
+/// Always does a full walk — incremental updates go through
+/// [`crate::refresh::refresh`]. There is no cache file to thread
+/// through; staleness is exclusively driven by Watchman.
 pub fn bake(opts: &BakeOptions) -> Result<(), BakeError> {
     bake_inner(opts).map_err(map_bake_err)
 }
@@ -331,10 +262,18 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
     std::fs::create_dir_all(&opts.out_dir)
         .with_context(|| format!("create out-dir: {}", opts.out_dir.display()))?;
     let db_file = opts.out_dir.join(DB_FILENAME);
-    let cache_file = opts.out_dir.join(CACHE_FILENAME);
 
     // Advisory flock on `<out_dir>/.asset-db.lock` — shared with
-    // `register` so concurrent invocations don't clobber bin/cache.
+    // `register` so concurrent invocations don't clobber the bin.
+    // `refresh::refresh` does NOT take this lock on its patch path; a
+    // lost-update race between two concurrent refreshes converges on
+    // the next query (Watchman replays the delta), so the cost of an
+    // unsynchronized write is benign and the simpler unlocked path
+    // wins. Don't introduce a lock here without checking
+    // `refresh::full_bake_into` first — it calls `bake::bake()` which
+    // takes this lock with `LockWait::Forever`, so any wrapping lock
+    // would deadlock the fallback path.
+
     let _lock = store::acquire_lock(&opts.out_dir, store::LockWait::Forever)
         .with_context(|| format!("lock: {}", opts.out_dir.display()))?;
 
@@ -351,19 +290,7 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
     synthesize_missing_metas(project_root, opts.on_progress.as_deref())
         .context("synthesize missing .meta files")?;
     let dt_prepass = t_prepass.elapsed();
-
-    // Load bake-only cache. Missing/corrupt → empty (first bake or stale).
-    let t_cache_io = Instant::now();
-    let cache_bytes = std::fs::read(&cache_file).ok();
-    let dt_cache_io = t_cache_io.elapsed();
-    let t_cache_decode = Instant::now();
-    let cache_decoded = cache_bytes.as_deref().and_then(|b| store::decode_cache(b).ok());
-    let dt_cache_decode = t_cache_decode.elapsed();
-    let t_cache_map = Instant::now();
-    let cache: CacheMap = cache_decoded.map(build_cache).unwrap_or_default();
-    let dt_cache_map = t_cache_map.elapsed();
-    let cache_size = cache.len();
-    let t_cache = t_start.elapsed();
+    let t_setup = t_start.elapsed();
 
     // Per-thread accumulators: each worker drops its `Vec<RawEntry>` and
     // `Vec<String>` (errors) into channels at thread exit via `Drop`. Avoids
@@ -375,16 +302,12 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
     // factory time — the clone cost is negligible vs the per-entry work.
     let (raw_tx, raw_rx) = mpsc::channel::<Vec<RawEntry>>();
     let (err_tx, err_rx) = mpsc::channel::<Vec<String>>();
-    let cache_arc = Arc::new(cache);
-    let cache_hits = Arc::new(AtomicUsize::new(0));
     let walked = Arc::new(AtomicUsize::new(0));
     let project_root_arc: Arc<PathBuf> = Arc::new(project_root.clone());
 
     walk_meta_files(project_root, || {
         let raw_tx = raw_tx.clone();
         let err_tx = err_tx.clone();
-        let cache = Arc::clone(&cache_arc);
-        let cache_hits = Arc::clone(&cache_hits);
         let walked = Arc::clone(&walked);
         let project_root = Arc::clone(&project_root_arc);
         let mut local = ThreadLocal {
@@ -404,7 +327,7 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
             // `run_with_panic_safety`.
             let label = meta_path.display().to_string();
             match run_with_panic_safety(&label, "process_one", || {
-                process_one(meta_path, &project_root, &cache, &cache_hits)
+                process_one(meta_path, &project_root)
             }) {
                 Ok(Some(r)) => local.entries.push(r),
                 Ok(None) => {}
@@ -426,17 +349,11 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
         }
     }
 
-    let mut raw: Vec<RawEntry> = Vec::with_capacity(cache_size + 256);
+    let mut raw: Vec<RawEntry> = Vec::with_capacity(2048);
     for v in raw_rx.iter() {
         raw.extend(v);
     }
-    // Build cache from `raw` (consumes nothing) before `build_db` consumes
-    // it. Sequence the writes so the cache is only persisted after the
-    // convert artifact lands — a half-baked cache without a matching db
-    // would let a later run skip parsing for entries that aren't in the
-    // db yet.
-    let bake_cache = build_bake_cache(&raw);
-    let db = build_db(
+    let mut db = build_db(
         raw,
         opts.name_sanitizer.as_deref(),
         opts.on_warn.as_deref(),
@@ -444,20 +361,33 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
     )?;
     let t_build = t_start.elapsed();
 
-    // No-op skip: every entry came from cache AND nothing was dropped from
-    // cache (count stable). Skips ~2-3 ms of bincode encode + file write
-    // on the steady-state warm path. Still skips only when both files are
-    // present — first run or after a manual delete writes anyway.
-    let hit_n = cache_hits.load(Ordering::Relaxed);
-    let no_op =
-        hit_n == cache_size && hit_n == db.entries.len() && db_file.exists() && cache_file.exists();
+    // Seed the Watchman clock so the next `refresh` can ask for a
+    // delta. We treat any failure here as "no clock available" — the
+    // bake itself succeeds; the next refresh just full-bakes again.
+    // The clock comes from the `Fresh` variant of a `since(None)` call
+    // (Watchman always returns Fresh on a None cursor).
+    db.watchman_clock = match crate::watch::since(project_root, None) {
+        Ok(crate::watch::Delta::Fresh { new_clock }) => Some(new_clock),
+        Ok(crate::watch::Delta::Touched { new_clock, .. }) => Some(new_clock),
+        Err(crate::watch::WatchError::Unavailable) => {
+            // Surface the same one-line nudge `refresh` emits so a
+            // fresh `bake` against a watchman-less box doesn't quietly
+            // ship a clock-less bin that the next query has to re-bake.
+            if let Some(sink) = opts.on_warn.as_ref() {
+                sink("watchman unavailable; install (brew install watchman) for incremental updates");
+            }
+            None
+        }
+        Err(crate::watch::WatchError::Query(e)) => {
+            if let Some(sink) = opts.on_warn.as_ref() {
+                sink(&format!("watchman query failed during bake clock seed: {e}"));
+            }
+            None
+        }
+    };
 
-    if !no_op {
-        store::write(&db_file, &db)
-            .with_context(|| format!("write asset-db: {}", db_file.display()))?;
-        store::write_cache(&cache_file, &bake_cache)
-            .with_context(|| format!("write cache: {}", cache_file.display()))?;
-    }
+    store::write(&db_file, &db)
+        .with_context(|| format!("write asset-db: {}", db_file.display()))?;
     let t_write = t_start.elapsed();
 
     if let Some(sink) = opts.on_progress.as_ref() {
@@ -468,15 +398,9 @@ fn bake_inner(opts: &BakeOptions) -> Result<()> {
         ));
         if opts.verbose_timing {
             let walked_n = walked.load(Ordering::Relaxed);
-            let parsed_n = db.entries.len() - hit_n;
-            let write_phase = if no_op { "skipped" } else { "wrote" };
             sink(&format!(
-                "  prepass={dt_prepass:?} cache_io={dt_cache_io:?} cache_decode={dt_cache_decode:?} cache_map={dt_cache_map:?}",
-            ));
-            sink(&format!(
-                "  walked={walked_n} hit={hit_n} parsed={parsed_n} | cache={:?} walk={:?} build={:?} write={:?} ({write_phase}) total={:?}",
-                t_cache,
-                t_walk - t_cache,
+                "  walked={walked_n} | prepass={dt_prepass:?} setup={t_setup:?} walk={:?} build={:?} write={:?} total={:?}",
+                t_walk - t_setup,
                 t_build - t_walk,
                 t_write - t_build,
                 t_write,
@@ -572,25 +496,53 @@ pub fn parse_one(
     project_root: &Path,
     meta_path: &Path,
 ) -> Result<Option<ParsedEntry>, BakeError> {
-    parse_one_inner(project_root, meta_path).map_err(map_bake_err)
+    Ok(parse_one_raw(project_root, meta_path)?.map(raw_to_parsed))
 }
 
-fn parse_one_inner(project_root: &Path, meta_path: &Path) -> Result<Option<ParsedEntry>> {
-    let companion =
-        strip_meta_suffix(meta_path).ok_or_else(|| anyhow::anyhow!("not a .meta path"))?;
-    let hint = rel_hint(project_root, &companion)?;
-    let meta_md =
-        std::fs::metadata(meta_path).with_context(|| format!("stat: {}", meta_path.display()))?;
-    let meta_mtime_ns = mtime_ns(meta_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
-    let Ok(companion_md) = std::fs::metadata(&companion) else {
-        return Ok(None);
+/// Like [`parse_one`] but returns the internal [`RawEntry`] shape that
+/// the post-walk dedup pipeline ([`build_db_from_raw`]) consumes.
+/// Pre-dedup, pre-script-intern — caller is responsible for both.
+///
+/// Used by [`crate::refresh::patch`] to re-parse a single touched hint
+/// and splice it into an existing `AssetDb` via `build_db_from_raw`.
+pub(crate) fn parse_one_raw(
+    project_root: &Path,
+    meta_path: &Path,
+) -> Result<Option<RawEntry>, BakeError> {
+    process_one(meta_path, project_root).map_err(map_bake_err)
+}
+
+/// Lift an already-baked [`AssetEntry`] back into the pre-dedup
+/// [`RawEntry`] shape. Used by [`crate::refresh::patch`] to feed surviving
+/// db entries through [`build_db_from_raw`] alongside freshly-parsed
+/// hints — the dedup machinery then re-deduplicates the union.
+///
+/// `script_types` is the `AssetDb::script_types` table the entry's
+/// `AssetType::Script(idx)` variant indexes into; needed to recover the
+/// raw u128 script GUID for the `AssetTypeRaw::Script(g)` discriminator.
+pub(crate) fn raw_from_entry(entry: &AssetEntry, script_types: &[u128]) -> RawEntry {
+    let asset_type_raw = match entry.asset_type {
+        AssetType::Native(n) => AssetTypeRaw::Native(n),
+        AssetType::Script(idx) => AssetTypeRaw::Script(script_types[idx as usize]),
     };
-    if companion_md.is_dir() {
-        return Ok(None);
+    RawEntry {
+        guid: entry.guid,
+        asset_type_raw,
+        hint: entry.hint.to_string(),
+        name: entry.name.to_string(),
+        sub_assets: entry.sub_assets.clone(),
     }
-    let asset_mtime_ns = mtime_ns(companion_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
-    let raw = process_one_uncached(meta_path, &companion, &hint, meta_mtime_ns, asset_mtime_ns)?;
-    Ok(raw.map(raw_to_parsed))
+}
+
+/// Public wrapper around the post-walk dedup/build pipeline. Same
+/// semantics as the full bake's post-walk phase: sort raw entries by
+/// hint, dedupe names with type-aware collision suffixes, intern
+/// script GUIDs, return a sorted [`AssetDb`].
+///
+/// Sinks default to silent — refresh's patch path doesn't surface
+/// dedup warnings (steady-state should be no-op).
+pub(crate) fn build_db_from_raw(raw: Vec<RawEntry>) -> Result<AssetDb, BakeError> {
+    build_db(raw, None, None, false).map_err(map_bake_err)
 }
 
 fn raw_to_parsed(r: RawEntry) -> ParsedEntry {
@@ -601,8 +553,6 @@ fn raw_to_parsed(r: RawEntry) -> ParsedEntry {
             AssetTypeRaw::Script(g) => ParsedAssetType::Script(g),
         },
         hint: r.hint,
-        meta_mtime_ns: r.meta_mtime_ns,
-        asset_mtime_ns: r.asset_mtime_ns,
         sub_assets: r.sub_assets,
     }
 }
@@ -620,69 +570,29 @@ fn map_bake_err(e: anyhow::Error) -> BakeError {
 }
 
 /// Per-`.meta` work. Returns `Ok(None)` when the meta has no companion file
-/// to describe (e.g. orphaned `.meta`, directory `.meta`).
-fn process_one(
-    meta_path: &Path,
-    project_root: &Path,
-    cache: &CacheMap,
-    cache_hits: &AtomicUsize,
-) -> Result<Option<RawEntry>> {
+/// to describe (e.g. orphaned `.meta`, directory `.meta`). Shared by the
+/// bake worker loop and the single-file [`parse_one_raw`] path.
+fn process_one(meta_path: &Path, project_root: &Path) -> Result<Option<RawEntry>> {
     let companion =
         strip_meta_suffix(meta_path).ok_or_else(|| anyhow::anyhow!("not a .meta path"))?;
-
     let hint = rel_hint(project_root, &companion)?;
-
-    // Cache-hit fast path: stat `.meta` only. If the mtime matches the
-    // cache, trust the cached row outright — no companion stat. Saves
-    // ~1 stat × N entries on the warm bake, the bake's dominant cost
-    // (warm walk against meow-tower dropped from 47 ms → ~26 ms).
-    //
-    // **Cache assumption**: Unity's importer touches the `.meta` mtime
-    // whenever it re-imports the asset, so a `.meta` mtime drift is the
-    // canonical "this asset changed" signal. Hand-editing the asset YAML
-    // *without* touching the .meta will serve a stale cached row until
-    // the next .meta touch (or a manual `rm asset-db.cache.bin`).
-    // Documented + pinned by `tests/bake.rs::cache_does_not_detect_asset_only_touch`.
-    let meta_md =
-        std::fs::metadata(meta_path).with_context(|| format!("stat: {}", meta_path.display()))?;
-    let meta_mtime_ns = mtime_ns(meta_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
-
-    if let Some(cached) = cache.get(&hint)
-        && cached.meta_mtime_ns == meta_mtime_ns
-    {
-        cache_hits.fetch_add(1, Ordering::Relaxed);
-        // `cached.hint` is intentionally empty (see `build_cache`) — the
-        // hit's hint is the one we computed above, identical bytes either
-        // way. One allocation per hit instead of two.
-        let mut out = cached.clone();
-        out.hint = hint;
-        return Ok(Some(out));
-    }
-
-    // Cache miss. Now stat the companion — handles directory-`.meta`
-    // exclusion too. Slow path beyond here re-parses both files.
     let Ok(companion_md) = std::fs::metadata(&companion) else {
         return Ok(None);
     };
     if companion_md.is_dir() {
         return Ok(None);
     }
-    let asset_mtime_ns = mtime_ns(companion_md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
-
-    process_one_uncached(meta_path, &companion, &hint, meta_mtime_ns, asset_mtime_ns)
+    parse_meta_and_asset(meta_path, &companion, &hint)
 }
 
-/// Slow path: parse `.meta` + asset YAML, build a `RawEntry`. Shared
-/// between the "no cache row at all" and "cache row but companion mtime
-/// drifted" cases — both end up doing the same parse work.
-fn process_one_uncached(
+/// Parse `.meta` + asset YAML into a [`RawEntry`]. Split from
+/// [`process_one`] for readability; the orphan/dir guards stay in
+/// [`process_one`] so this body is purely the parse step.
+fn parse_meta_and_asset(
     meta_path: &Path,
     companion: &Path,
     hint: &str,
-    meta_mtime_ns: u64,
-    asset_mtime_ns: u64,
 ) -> Result<Option<RawEntry>> {
-    // Cache miss → parse.
     let meta_text = std::fs::read_to_string(meta_path)
         .with_context(|| format!("read .meta: {}", meta_path.display()))?;
     let meta_info = meta::parse(&meta_text)?;
@@ -789,8 +699,6 @@ fn process_one_uncached(
         asset_type_raw,
         hint: hint.to_string(),
         name,
-        meta_mtime_ns,
-        asset_mtime_ns,
         sub_assets,
     }))
 }
@@ -842,12 +750,11 @@ fn build_db(
     // Stable order: sort by hint so dedup picks the same "winner" each bake.
     raw.sort_by(|a, b| a.hint.cmp(&b.hint));
 
-    // Reset every entry's name to its raw `<stem>.<ext>` before dedup
-    // (cached entries arrive with their previously-suffixed name; if we
-    // dedup against that, collisions compound across bakes), then sanitize
-    // ref-reserved chars in both top-level and sub-asset names — covers the
-    // three name sources (filename stem, YAML m_Name sub-assets, `.meta`
-    // sprite-sheet entries) in one pass before dedup uses `r.name` as key.
+    // Reset every entry's name to its raw `<stem>.<ext>` before dedup,
+    // then sanitize ref-reserved chars in both top-level and sub-asset
+    // names — covers the three name sources (filename stem, YAML m_Name
+    // sub-assets, `.meta` sprite-sheet entries) in one pass before dedup
+    // uses `r.name` as key.
     for r in raw.iter_mut() {
         r.name = filename_with_ext_from_hint(&r.hint);
         if let Some(san) = sanitizer
@@ -1463,8 +1370,8 @@ mod tests {
             // `build_db`'s first pass overwrites `name` from `hint`, so any
             // value here is fine. Empty kept the test minimal.
             name: String::new(),
-            meta_mtime_ns: 0,
-            asset_mtime_ns: 0,
+            
+            
             sub_assets,
         }
     }
@@ -1577,8 +1484,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::MonoScript as u32),
                 hint: "Packages/com.boxcat.libs/UniTask/Runtime/Utils/L.cs".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
             RawEntry {
@@ -1586,8 +1493,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::MonoScript as u32),
                 hint: "Packages/com.boxcat.libs/Zenject/Runtime/Utils/L.cs".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];
@@ -1635,8 +1542,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::Texture2D as u32),
                 hint: "Assets/UI/Foo.png".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
             RawEntry {
@@ -1644,8 +1551,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
                 hint: "Assets/UI/Foo.prefab".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];
@@ -1676,8 +1583,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::AnimatorController as u32),
                 hint: "Assets/Anim/Player.controller".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![SubAsset {
                     file_id: -123_456_789_012,
                     class_id: ANIMATOR_STATE_CLASS_ID,
@@ -1692,8 +1599,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ANIMATOR_STATE_CLASS_ID),
                 hint: "Assets/Other/Idle.asset".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];
@@ -1725,8 +1632,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::AudioMixerController as u32),
                 hint: "Assets/Audio/Main.mixer".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![SubAsset {
                     file_id: 9_001,
                     class_id: AUDIO_MIXER_GROUP_CLASS_ID,
@@ -1738,8 +1645,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(AUDIO_MIXER_GROUP_CLASS_ID),
                 hint: "Assets/Other/Master.asset".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];
@@ -1776,8 +1683,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Script(some_script_guid),
                 hint: "Assets/Anim/PlayableA.playable".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![SubAsset {
                     file_id: -123_456_789,
                     class_id: ANIMATION_TRACK_CLASS_ID,
@@ -1789,8 +1696,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Script(some_script_guid),
                 hint: "Assets/Anim/PlayableB.playable".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![SubAsset {
                     file_id: -987_654_321,
                     class_id: ANIMATION_TRACK_CLASS_ID,
@@ -1825,8 +1732,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
                 hint: "Assets/UI/PatternBG.prefab".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![SubAsset {
                     file_id: -4_468_419_427_481_386_445,
                     class_id: ClassId::AnimationClip as u32,
@@ -1838,8 +1745,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::AnimationClip as u32),
                 hint: "Assets/Other/Animation.anim".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];
@@ -1894,8 +1801,8 @@ mod tests {
             asset_type_raw: AssetTypeRaw::Native(ClassId::DefaultAsset as u32),
             hint: "Assets/Misc/README".to_string(),
             name: String::new(),
-            meta_mtime_ns: 0,
-            asset_mtime_ns: 0,
+            
+            
             sub_assets: vec![],
         }];
         let db = build_db(raw, None, None, false).expect("build_db should succeed");
@@ -1915,8 +1822,8 @@ mod tests {
             asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
             hint: "Assets/UI/Foo.prefab".to_string(),
             name: String::new(),
-            meta_mtime_ns: 0,
-            asset_mtime_ns: 0,
+            
+            
             sub_assets: vec![],
         }];
 
@@ -1942,8 +1849,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::SceneAsset as u32),
                 hint: "Assets/Sandbox/BoxKeyObtainLongtake.unity".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
             RawEntry {
@@ -1951,8 +1858,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Script(timeline_script_guid),
                 hint: "Assets/Prefabs/BoxKeyObtainLongtake.playable".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
             RawEntry {
@@ -1960,8 +1867,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::MonoScript as u32),
                 hint: "Assets/Scripts/BoxKeyObtainLongtake.cs".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
             RawEntry {
@@ -1969,8 +1876,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
                 hint: "Assets/Prefabs/BoxKeyObtainLongtake.prefab".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];
@@ -2009,8 +1916,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Script(installer_script),
                 hint: "Assets/OrgelEvent/OrgelActivityTimeline.asset".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
             RawEntry {
@@ -2018,8 +1925,8 @@ mod tests {
                 asset_type_raw: AssetTypeRaw::Script(timeline_script),
                 hint: "Assets/OrgelEvent/OrgelActivityTimeline.playable".to_string(),
                 name: String::new(),
-                meta_mtime_ns: 0,
-                asset_mtime_ns: 0,
+                
+                
                 sub_assets: vec![],
             },
         ];

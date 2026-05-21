@@ -17,15 +17,18 @@ same reference resolves to a stable, readable name (`TX_FlagBig_Main`).
 
 ## Storage
 
-Two on-disk files, by default under `<project>/Library/<consumer>/`
+One on-disk file, by default under `<project>/Library/<consumer>/`
 (gitignored — `Library/` is Unity's regenerable cache directory). The
 consumer picks the subdir; this crate doesn't bake the path. The CLI
 defaults to `<project>/Library/unity-assetdb/`.
 
 | File | Role | Read by |
 |------|------|---------|
-| `asset-db.bin` | **Convert artifact** — lean: `(guid, asset_type, name, sub_assets, hint)` per entry. Sorted by GUID for O(log n) lookups. | downstream consumer + bake |
-| `asset-db.cache.bin` | **Bake-only cache** — `(hint, mtimes, resolved bake state)` per entry. | bake |
+| `asset-db.bin` | **Convert artifact** — `(guid, asset_type, name, sub_assets, hint)` per entry. Sorted by GUID for O(log n) lookups. Header also carries an opaque Watchman clock token (see [[refresh.md]]). | downstream consumer + bake + refresh |
+
+A second file (`asset-db.cache.bin`) used to live alongside as a
+mtime-keyed parse cache. It was removed in schema v7 — see
+[[refresh.md]] for the Watchman-driven replacement that obviated it.
 
 ### Binary schema
 
@@ -35,7 +38,8 @@ Defined in `src/store.rs`. Bincode-2, magic-prefixed.
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `schema_version` | `u16` | Bumped on incompatible schema changes; mismatch → re-bake required. |
+| `schema_version` | `u16` | Bumped on incompatible schema changes; mismatch → re-bake required. Currently **7** (Watchman cutover). |
+| `watchman_clock` | `Option<String>` | Opaque clock token from the last [`refresh`](refresh.md) or full bake. `None` means "no Watchman state yet" — next refresh treats it as `Fresh` and full-bakes to seed. |
 | `script_types` | `Vec<u128>` | Interned script GUIDs (sorted, dedup'd). Indexed by `AssetType::Script`. |
 | `entries` | `Vec<AssetEntry>` | **Sorted by GUID** for O(log n) binary-search lookup. |
 
@@ -51,7 +55,6 @@ Each `AssetEntry`:
 
 `Box<str>` instead of `String` saves 8 bytes per string (no growable-capacity field) once decoded.
 
-**`asset-db.cache.bin`** — bake-only side file. Same magic-prefixed bincode envelope. Each entry: `(hint, meta_mtime_ns, asset_mtime_ns, guid, asset_type, sub_assets)`. Hint here is the cache lookup key; everything else lets a re-bake reconstruct the entry without re-parsing the .meta + asset. `name` is **not** cached — it's re-derived as `<stem>.<ext>` from the hint and re-applied to the [Name collisions](#name-collisions) rule on every bake, so the within-ext bare ↔ `^path` promote/demote stays current as siblings come and go.
 
 ### Asset typing
 
@@ -78,10 +81,14 @@ A name in pull output resolves by GUID + fileID:
 `<project>/Assets/` and `<project>/Packages/` in parallel via the
 [`ignore`] crate and writes the binary. Without `--project` the
 command climbs from CWD until both `Assets/` and `ProjectSettings/`
-are found. `--out-dir` redirects both `asset-db.bin` and the sibling
-`asset-db.cache.bin` away from the default — used for fixture-regen
-recipes that read from an upstream Unity project but must not write
-back into it.
+are found. `--out-dir` redirects `asset-db.bin` away from the default
+— used for fixture-regen recipes that read from an upstream Unity
+project but must not write back into it.
+
+**Bake vs refresh.** Every query subcommand auto-refreshes via Watchman
+([[refresh.md]]) before serving its answer — explicit `bake` is for
+scripts, CI, or forcing a re-walk after a schema bump. Most
+interactive users never type `bake` directly.
 
 **Walker ignore behavior** is intentionally narrower than `ignore`'s
 default `standard_filters`:
@@ -141,15 +148,14 @@ Unity tools can honor the same rules:
   synthesizing metas there would dirty an unrelated working tree. Pinned
   by `tests/bake.rs::bake_does_not_synthesize_inside_git_submodules`.
 
-The bake is mtime-cached via `asset-db.cache.bin`: re-runs only re-parse
-files whose `.meta` or asset mtime has changed. On a 16k-entry project
-(meow-tower), cold ≈ 370 ms, warm ≈ 60 ms.
+The bake always re-walks the full tree. There's no longer an in-bake
+fast path — incremental updates go through [`refresh`](refresh.md)
+(Watchman-driven). On meow-tower, cold full bake ≈ 1 s; subsequent
+queries hit the refresh path at ≈ 120 ms steady-state. See
+[`profiling.md`](profiling.md) for the breakdown.
 
-**Idempotent re-bakes** — when every entry is a cache hit and the count is
-stable — skip both file writes entirely, holding mtimes stable across no-op
-runs. Set the consumer's verbose-timing flag (`UNITY_ASSETDB_TIMING=1` for
-the CLI) for a per-phase line (`cache / walk / build / write`). The `write`
-field shows `(skipped)` when the no-op path triggers.
+Set the consumer's verbose-timing flag (`UNITY_ASSETDB_TIMING=1` for
+the CLI) for a per-phase line (`prepass / walk / build / write`).
 
 ### Library use
 
@@ -304,6 +310,6 @@ sub-asset name, before dedup; warnings flow through `on_warn`.
 
 ## When to regenerate
 
-- New asset / move / rename / GUID change → re-run `unity-assetdb bake`. Mtime-cached, fast.
+- New asset / move / rename / GUID change → next `unity-assetdb` query auto-refreshes via Watchman; explicit `bake` only needed for schema bumps or forced re-walks. See [[refresh.md]].
 - Sub-asset added (new sprite in a sheet, new clip in a model) → same.
 - Schema bump → forced re-bake (loader hard-fails on `schema_version` mismatch).
