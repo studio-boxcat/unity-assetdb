@@ -9,6 +9,8 @@
 pub enum MetaParseError {
     #[error("missing or malformed `guid:` in .meta")]
     MissingGuid,
+    #[error("io error reading .meta: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// `TextureImporter.textureType` enum — Unity only auto-generates a
@@ -70,6 +72,22 @@ pub fn parse_guid(text: &str) -> Result<u128, MetaParseError> {
         return Err(MetaParseError::MissingGuid);
     }
     u128::from_str_radix(hex, 16).map_err(|_| MetaParseError::MissingGuid)
+}
+
+/// [`parse_guid`] direct from disk — reads only the header prefix the
+/// canonical layout reaches into (BOM + `fileFormatVersion: 2` + EOL +
+/// `guid: <32hex>` + trailing EOL byte = at most 64 bytes), avoiding a
+/// full-file load for callers that just want the GUID.
+pub fn read_guid(path: &std::path::Path) -> Result<u128, MetaParseError> {
+    use std::io::Read;
+    // 64 = 3 (BOM) + 20 ("fileFormatVersion: 2") + 2 ("\r\n") + 6 ("guid: ")
+    //    + 32 (hex) + 1 (EOL we assert in parse_guid).
+    let mut buf = Vec::with_capacity(64);
+    std::fs::File::open(path)?
+        .take(64)
+        .read_to_end(&mut buf)?;
+    let text = std::str::from_utf8(&buf).map_err(|_| MetaParseError::MissingGuid)?;
+    parse_guid(text)
 }
 
 /// Parse a `.meta` file's text contents.
@@ -216,6 +234,28 @@ mod tests {
         for text in [plain_lf, plain_crlf, bom_lf, bom_crlf] {
             assert_eq!(parse_guid(text).unwrap(), g);
         }
+    }
+
+    #[test]
+    fn read_guid_reads_only_header_bytes() {
+        // Tail bytes after the canonical header must be ignored — proving
+        // read_guid doesn't depend on consuming the whole file.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.meta");
+        let header = "fileFormatVersion: 2\nguid: 7d602c2080b53413fa393df6b2c0af43\n";
+        let mut content = String::from(header);
+        content.push_str(&"x".repeat(1_000_000));
+        std::fs::write(&p, &content).unwrap();
+        assert_eq!(
+            read_guid(&p).unwrap(),
+            0x7d602c2080b53413fa393df6b2c0af43_u128,
+        );
+    }
+
+    #[test]
+    fn read_guid_propagates_io_error() {
+        let err = read_guid(std::path::Path::new("/does/not/exist.meta")).unwrap_err();
+        assert!(matches!(err, MetaParseError::Io(_)));
     }
 
     #[test]
