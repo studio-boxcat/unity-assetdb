@@ -319,7 +319,7 @@ fn parse_existing_meta(
         path: meta_path.to_path_buf(),
         source,
     })?;
-    let info = crate::meta::parse(&text).map_err(|e| RegisterError::Io {
+    let guid = crate::meta::parse_guid(&text).map_err(|e| RegisterError::Io {
         op: "parse meta",
         path: meta_path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
@@ -333,7 +333,7 @@ fn parse_existing_meta(
             });
         }
     }
-    Ok(info.guid)
+    Ok(guid)
 }
 
 /// Find the importer YAML key in an existing meta. Looks for the first
