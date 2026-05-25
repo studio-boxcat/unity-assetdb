@@ -498,17 +498,32 @@ pub(crate) fn parse_one_raw(
 /// `script_types` is the `AssetDb::script_types` table the entry's
 /// `AssetType::Script(idx)` variant indexes into; needed to recover the
 /// raw u128 script GUID for the `AssetTypeRaw::Script(g)` discriminator.
+/// Convert a stored `AssetEntry` back to raw form for re-processing
+/// through `build_db`. Strips collision suffixes (`^…`) from sub-asset
+/// names so `build_db` sees only raw authored names and can validate +
+/// re-apply dedup from scratch. Top-level names are reset from hints
+/// inside `build_db`; sub-asset names have no external source, so this
+/// is the only place to restore them.
 pub(crate) fn raw_from_entry(entry: &AssetEntry, script_types: &[u128]) -> RawEntry {
     let asset_type_raw = match entry.asset_type {
         AssetType::Native(n) => AssetTypeRaw::Native(n),
         AssetType::Script(idx) => AssetTypeRaw::Script(script_types[idx as usize]),
     };
+    let sub_assets: Vec<SubAsset> = entry
+        .sub_assets
+        .iter()
+        .map(|s| SubAsset {
+            file_id: s.file_id,
+            class_id: s.class_id,
+            name: strip_collision_suffix(&s.name),
+        })
+        .collect();
     RawEntry {
         guid: entry.guid,
         asset_type_raw,
         hint: entry.hint.to_string(),
         name: entry.name.to_string(),
-        sub_assets: entry.sub_assets.clone(),
+        sub_assets,
     }
 }
 
@@ -711,18 +726,34 @@ fn synthesize_implicit_sprite(meta: &meta::MetaInfo, stem: &str) -> Option<SubAs
     }
 }
 
-/// Hard-fail on `/` in any asset / sub-asset name. `kind` is "asset"
-/// for top-level, "sub-asset of" for embedded — surfaces in the error
-/// message so the user can locate the offending YAML.
-fn reject_slash(name: &str, kind: &str, hint: &str) -> Result<()> {
-    if name.contains('/') {
-        anyhow::bail!(
-            "{kind} `{hint}` has name `{name}` containing `/`; \
-             reserved as a path separator and structural delimiter \
-             in downstream reference grammars. Fix the source YAML \
-             (top-level stems can't contain `/` on Unix; sub-asset \
-             names come from `m_Name`).",
-        );
+/// Strip the bake-generated collision suffix (`^…`) from a sub-asset
+/// name, returning the raw authored form. Called by `raw_from_entry`
+/// to restore stored names before feeding them back through `build_db`.
+fn strip_collision_suffix(name: &str) -> Box<str> {
+    match name.find('^') {
+        Some(i) => name[..i].into(),
+        None => Box::from(name),
+    }
+}
+
+/// Hard-fail on reserved chars in any asset / sub-asset name.
+///
+/// - `/` — path separator + downstream ref-grammar delimiter.
+/// - `^` — collision-suffix separator (`stem^suffix`); an authored `^`
+///   would be silently stripped by [`strip_collision_suffix`] on the
+///   refresh round-trip, corrupting the name.
+///
+/// `kind` is "asset" for top-level, "sub-asset of" for embedded —
+/// surfaces in the error message so the user can locate the source.
+fn reject_reserved(name: &str, kind: &str, hint: &str) -> Result<()> {
+    for ch in ['/', '^'] {
+        if name.contains(ch) {
+            anyhow::bail!(
+                "{kind} `{hint}` has name `{name}` containing `{ch}`; \
+                 reserved character in the asset-db naming scheme. \
+                 Fix the source YAML (sub-asset names come from `m_Name`).",
+            );
+        }
     }
     Ok(())
 }
@@ -735,17 +766,14 @@ fn build_db(
     // Stable order: sort by hint so dedup picks the same "winner" each bake.
     raw.sort_by(|a, b| a.hint.cmp(&b.hint));
 
-    // Reset every entry's name to its raw `<stem>.<ext>` before dedup.
-    // Top-level stems can never contain `/` on Unix (it's the path
-    // separator); sub-asset names come from YAML `m_Name` and might.
-    // Reject `/` universally — every consumer-side reference grammar
-    // we've seen uses it as a structural delimiter, and silently
-    // rewriting it would mask a malformed asset YAML.
+    // Reset top-level names from hints; validate all names for reserved
+    // chars. Sub-asset names arrive pre-stripped by `raw_from_entry` on
+    // the refresh path, so `build_db` only ever sees raw authored names.
     for r in raw.iter_mut() {
         r.name = filename_with_ext_from_hint(&r.hint);
-        reject_slash(&r.name, "asset", &r.hint)?;
+        reject_reserved(&r.name, "asset", &r.hint)?;
         for sub in &r.sub_assets {
-            reject_slash(&sub.name, "sub-asset of", &r.hint)?;
+            reject_reserved(&sub.name, "sub-asset of", &r.hint)?;
         }
     }
 
@@ -1922,6 +1950,55 @@ mod tests {
     /// hard-fails rather than silently falling back to a `^<guid8>` suffix.
     /// Per the project policy: ambiguity surfaces at bake time, not encode
     /// time. (Distinct exts on the same stem fall into distinct buckets
+    /// Round-trip: bake with contested sub-assets → `raw_from_entry` →
+    /// `build_db` again. The first bake produces sub-asset names like
+    /// `1^ConflictPopup/Screens`; `build_db` must strip the `^…` suffix
+    /// before `reject_reserved` so the round-trip succeeds and dedup
+    /// re-applies cleanly.
+    #[test]
+    fn build_db_round_trips_contested_sub_asset_names() {
+        let sprite_fid: i64 = 21300000;
+        let raw = vec![
+            raw_native(
+                "Assets/20_Contents/ConflictPopup/Screens/1.png",
+                0xa0,
+                vec![SubAsset {
+                    file_id: sprite_fid,
+                    class_id: ClassId::Sprite as u32,
+                    name: "1".into(),
+                }],
+            ),
+            raw_native(
+                "Assets/20_Contents/ShopPopup/Screens/1.png",
+                0xb0,
+                vec![SubAsset {
+                    file_id: sprite_fid,
+                    class_id: ClassId::Sprite as u32,
+                    name: "1".into(),
+                }],
+            ),
+        ];
+
+        // First bake — contested sub-asset "1" gets depth-2 suffix with `/`.
+        let db1 = build_db(raw, None, false).expect("first bake");
+        let a = db1.find_by_guid(0xa0).unwrap();
+        assert_eq!(&*a.sub_assets[0].name, "1^ConflictPopup/Screens");
+
+        // Round-trip: convert baked entries back to raw and re-build.
+        let raw2: Vec<RawEntry> = db1
+            .entries
+            .iter()
+            .map(|e| raw_from_entry(e, &db1.script_types))
+            .collect();
+        let db2 = build_db(raw2, None, false).expect("round-trip bake must not fail");
+
+        // Same result — collision suffixes re-applied identically.
+        let a2 = db2.find_by_guid(0xa0).unwrap();
+        let b2 = db2.find_by_guid(0xb0).unwrap();
+        assert_eq!(&*a2.sub_assets[0].name, "1^ConflictPopup/Screens");
+        assert_eq!(&*b2.sub_assets[0].name, "1^ShopPopup/Screens");
+    }
+
     /// under the always-ext rule and never reach `parent_suffix`.)
     #[test]
     fn build_db_fails_when_dedup_cannot_resolve() {

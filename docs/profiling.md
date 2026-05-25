@@ -59,7 +59,7 @@ phases now that the mtime cache is gone:
 |-------|--------|
 | `prepass` | `synthesize_missing_metas` — walk `Assets/` + `Packages/<pkg>/` once to find files lacking `.meta`, write minimal metas for new ones. |
 | `walk` | Parallel `ignore::WalkBuilder` traversal of `Assets/` + per-`.meta` `process_one` (`.meta` parse, asset YAML peek, sub-asset extraction). |
-| `build` | `build_db` — sub-asset dedup pass (type-aware bucketing, depth-2 parent-dir suffix or GUID-prefix for MonoScripts) + script-guid interning + final sort. |
+| `build` | `build_db` — sub-asset dedup pass (type-aware bucketing, depth-2 parent-dir suffix or GUID-suffix for MonoScripts) + script-guid interning + final sort. |
 | `write` | `store::write` — bincode encode + atomic rename of `asset-db.bin`. Includes the `watch::since(None)` call that seeds the new clock token. |
 
 ### `refresh` phases

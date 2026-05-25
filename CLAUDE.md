@@ -49,6 +49,9 @@ query pipeline below). One sub-crate lives under `crates/`:
 - `usage` — scan project YAML for files referencing a given GUID
   (`find_usages`, `UsageMatch`). Native substitute for `rg <hex>` that
   knows which extensions are Unity YAML.
+- `builtin` — Unity engine-builtin GUID predicates (`is_builtin`,
+  bucket discrimination). These all-zeros-except-one-hex GUIDs identify
+  assets baked into the engine binary — never in `Assets/`.
 
 ## CLI
 
@@ -80,19 +83,13 @@ Without `--project`, walks up from the cwd until both `Assets/` and `ProjectSett
 are found. Without `--out-dir`, writes to `<project>/Library/unity-assetdb/`.
 
 **Auto-refresh.** Every query subcommand transparently refreshes the bin
-via [Watchman](docs/refresh.md) before serving its answer. Branches:
+via [Watchman](docs/refresh.md) before serving its answer. See
+[[refresh.md]] for the decision tree (bin-missing → full bake, empty
+delta → clock-only, small delta → patch, large/fresh → full bake,
+Watchman absent → full bake + stderr nudge).
 
-- bin missing / unreadable / schema-mismatched → full bake.
-- Watchman delta empty → no-op (bin already current).
-- Watchman delta small → patch in place.
-- Watchman delta huge / `fresh_instance` → full bake.
-- Watchman unreachable → full bake + one-line stderr nudge
-  (`brew install watchman`).
-
-Names containing `/` (top-level filename stems can't on Unix; sub-asset
-`m_Name` YAML fields can) **hard-fail** at bake time — `/` is universally
-reserved as a path separator and downstream ref-grammar delimiter, so
-silently rewriting it would mask malformed source YAML. Fix the source.
+Names containing `/` or `^` in source YAML **hard-fail** at bake time.
+See [[asset-database.md#reserved-character-policy]].
 
 Output discipline: data → stdout, warnings / suggestions / progress → stderr.
 TSV cells escape `\t`/`\n`/`\\`. JSON output is one object per line.

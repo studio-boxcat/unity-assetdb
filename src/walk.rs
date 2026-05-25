@@ -1,8 +1,10 @@
 //! Parallel walker over a Unity project's `Assets/` tree.
 //!
-//! Uses [`ignore::WalkBuilder`] with gitignore on (default) — the same
-//! mechanism `rg` / `fd` use, so anything the user already gitignores
-//! (Library/, Temp/, build artifacts) is skipped automatically.
+//! Uses [`ignore::WalkBuilder`] with `standard_filters(false)` — gitignore
+//! is deliberately OFF. Unity doesn't honor `.gitignore` either, and
+//! gitignored `.meta` files still carry GUIDs that prefabs can reference.
+//! `is_unity_hidden` (`.foo`, `foo~`) is the only filter.
+//! See [`asset_walk_builder`] and [[`asset-database.md`]](#populating).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

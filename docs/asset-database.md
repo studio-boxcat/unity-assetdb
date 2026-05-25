@@ -50,7 +50,7 @@ Each `AssetEntry`:
 | `guid` | `u128` | 32-hex Unity GUID. |
 | `asset_type` | `AssetType` | Tagged enum — `Native(class_id)` or `Script(script_idx)`. See [Asset typing](#asset-typing). |
 | `name` | `Box<str>` | `<stem>.<ext>` derived from `hint` on every bake, with optional collision suffix appended. See [Name collisions](#name-collisions). |
-| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Every addressable doc inside this asset, regardless of whether it's the file's "top" (first YAML doc) or "main" per `.meta::mainObjectFileID`. Consumers gate "is this row the main asset?" by comparing `file_id` against the parent entry's canonical-fid (`asset_type_to_file_id`) or, for files where `.meta::mainObjectFileID` is non-canonical, the meta-driven value. Includes sprite-sheet entries, sub-clips, the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures (fileID `21300000` = `ClassId::Sprite × 100_000`, name = bare filename stem; synthesized at bake since `.meta` omits it), and empty-named sub-docs (Mesh/Curve bodies in `.asset`, embedded clips that don't author `m_Name`) — empty-named rows stay in the parent's vec but bypass the global alias-bucket dedup since the empty name can't disambiguate. `class_id` stored explicitly so prefab-embedded sub-asset rows (whose hashed fileIDs would otherwise collapse via the `file_id / 100_000` heuristic) retain their real Unity class. Sorted by `file_id`. Synthesis predicate pinned by `bake::tests::synthesize_implicit_sprite_*` (4 branch tests); end-to-end smoke at `tests/bake.rs::implicit_sprite_subasset_synthesis`. |
+| `sub_assets` | `Vec<SubAsset { file_id: i64, class_id: u32, name: Box<str> }>` | Every addressable doc inside this asset. Includes sprite-sheet entries, sub-clips, the implicit Sprite sub-object Unity auto-generates for Single-mode Sprite textures (fileID `21300000`, name = bare filename stem; synthesized at bake since `.meta` omits it), and empty-named sub-docs (Mesh/Curve bodies in `.asset`) — empty-named rows bypass the global alias-bucket dedup. `class_id` stored explicitly so prefab-embedded sub-asset rows retain their real Unity class. Sorted by `file_id`. On refresh round-trip, `build_db` strips any prior collision suffix (`^…`) from sub-asset names before re-applying dedup — see `strip_collision_suffix` in `bake.rs`. |
 | `hint` | `Box<str>` | Project-root-relative path (`Assets/Foo.prefab`, `Packages/com.boxcat.libs/Bar.mixer`). Lets downstream consumers locate assets by guid without re-walking the project tree. |
 
 `Box<str>` instead of `String` saves 8 bytes per string (no growable-capacity field) once decoded.
@@ -277,16 +277,7 @@ identifier.
 The `^` separator is rare in Unity asset paths and (unlike parens) doesn't
 collide with naturally-paren-named assets like `QuestWidget (Side).prefab`.
 
-Pinned by `bake::tests::build_db_always_appends_ext_to_alias`,
-`build_db_disambiguates_cross_ext_collision_via_ext_suffix` (BoxKey
-case), `build_db_disambiguates_script_typed_cross_ext_via_ext_suffix`
-(Orgel timeline case), `parent_suffix_*` (pure-helper semantics),
-`guid_suffix_uses_first_8_hex_of_guid` +
-`build_db_uses_guid_suffix_for_contested_monoscripts` (MonoScript
-carve-out), `build_db_renames_every_claimant_when_name_is_contested`
-(no-winner rule), `build_db_contested_alias_is_independent_of_other_siblings`
-(stability), and `build_db_fails_when_two_contestants_share_depth_2_parent`
-(hard-fail).
+Pinned by `build_db_*` and `parent_suffix_*` unit tests in `bake.rs`.
 
 The bake also hard-fails if any `(name, guid, fileID, asset_type)` tuple
 appears twice in the final database — a defensive invariant that surfaces
@@ -296,13 +287,18 @@ excluded from the walk so that template/scratch copies don't trip the check.
 
 ### Reserved-character policy
 
-The bake leaves YAML `m_Name` values verbatim with one universal
-exception: **`/` is rejected at bake time** for any top-level or
-sub-asset name. The character is reserved as the Unix filesystem path
-separator *and* as a structural delimiter in every consumer-side
-reference grammar we've encountered; silently rewriting it would mask
-malformed source. The error surfaces through `BakeError` and names the
-offending hint so the user can fix the YAML.
+The bake leaves YAML `m_Name` values verbatim with two universal
+exceptions — both rejected at bake time for any top-level or sub-asset
+name:
+
+- **`/`** — reserved as the Unix filesystem path separator and as a
+  structural delimiter in every consumer-side reference grammar.
+- **`^`** — reserved as the collision-suffix separator (`stem^suffix`).
+  An authored `^` would be silently stripped by `strip_collision_suffix`
+  on the refresh round-trip, corrupting the name.
+
+The error surfaces through `BakeError` and names the offending hint so
+the user can fix the source YAML.
 
 Other consumer-specific reserved chars (`#`, `@`, `|`, etc.) are not
 this crate's concern — consumers validate lazily at ref-compose time

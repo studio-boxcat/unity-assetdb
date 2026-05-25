@@ -365,8 +365,52 @@ TextureImporter:
     let err = bake(&opts).expect_err("expected hard-fail on `/` in sub-asset name");
     let msg = format!("{err}");
     assert!(
-        msg.contains("containing `/`") && msg.contains("sub-asset of"),
-        "expected slash-rejection message, got: {msg}",
+        msg.contains("containing `/`") && msg.contains("sub-asset of")
+            || msg.contains("reserved character") && msg.contains("sub-asset of"),
+        "expected reserved-char rejection message, got: {msg}",
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Same as the slash test, but for `^` — the collision-suffix separator.
+/// An authored `^` would be silently stripped by `strip_collision_suffix`
+/// on the refresh round-trip, corrupting the name.
+#[test]
+fn caret_in_sub_asset_name_hard_fails() {
+    let root = unique_tmp("caret-reject");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("ProjectSettings")).unwrap();
+    write(
+        &root.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.0f1\n",
+    );
+    write(&root.join("Assets/Tex/Sheet.png"), "fake-png-bytes");
+    write(
+        &root.join("Assets/Tex/Sheet.png.meta"),
+        "fileFormatVersion: 2
+guid: deadbeefdeadbeefdeadbeefdeadbeef
+TextureImporter:
+  spriteSheet:
+    sprites:
+    - serializedVersion: 2
+      name: bad^caret
+      internalID: 11111
+",
+    );
+
+    let opts = BakeOptions {
+        project_root: root.to_path_buf(),
+        out_dir: out_dir_for(&root),
+        on_warn: None,
+        on_progress: None,
+        verbose_timing: false,
+        verbose_collisions: false,
+    };
+    let err = bake(&opts).expect_err("expected hard-fail on `^` in sub-asset name");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("containing `^`") && msg.contains("sub-asset of"),
+        "expected caret-rejection message, got: {msg}",
     );
     fs::remove_dir_all(&root).ok();
 }

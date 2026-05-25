@@ -67,71 +67,24 @@ bin directly. `bake` is the cold-path canonical.
 
 ```
 src/
-├─ watch.rs        (~210 LOC + 2 unit tests)
+├─ watch.rs         — sync facade over watchman_client's tokio API
 │   pub fn since(project_root, prev_clock) -> Result<Delta, WatchError>
-│   sync facade; wraps a current-thread tokio runtime per-call
-├─ refresh.rs      (~250 LOC + 7 unit tests)
+├─ refresh.rs       — orchestrator: since → patch / clock-only / full bake
 │   pub fn refresh(&mut db, project_root, out_dir, on_warn) -> Result<RefreshOutcome, RefreshError>
-│   pub const PATCH_THRESHOLD: usize = 5_000
-│   pub(crate) fn patch(&mut db, project_root, &[hint])
+│   pub(crate) fn patch(&mut db, project_root, &[String])
 ├─ bake.rs
-│   bake() unchanged shape; now seeds `db.watchman_clock` via watch::since(None)
 │   pub(crate) build_db_from_raw / raw_from_entry / parse_one_raw  ← reused by refresh
-├─ store.rs        (schema v7)
+├─ store.rs
 │   AssetDb { schema_version, watchman_clock: Option<String>, script_types, entries }
-│   Removed: BakeCache / CachedEntry / CACHE_FILENAME / cache_path / {read,write,encode,decode}_cache
 └─ bin/unity-assetdb.rs
     open_db_or_refresh — any StoreError → full bake; else refresh
 ```
 
 ## Types
 
-```rust
-// watch.rs
-pub enum Delta {
-    Fresh   { new_clock: String },
-    Touched { hints: Vec<String>, new_clock: String },
-}
-
-pub enum WatchError {
-    Unavailable,             // daemon not installed / unreachable
-    Query(anyhow::Error),    // BSER decode, query rejected, transport
-}
-
-pub fn since(project_root: &Path, prev_clock: Option<&str>)
-    -> Result<Delta, WatchError>;
-```
-
-```rust
-// refresh.rs
-pub enum RefreshOutcome {
-    ClockOnly,        // empty delta — clock advanced in memory only
-    Patched(usize),   // N hints went through patch + bin written
-    Rebaked,          // fell through to full bake + bin written
-}
-
-pub enum RefreshError {
-    Bake(BakeError),
-    Store(StoreError),
-}
-
-pub fn refresh(
-    db: &mut AssetDb,
-    project_root: &Path,
-    out_dir: &Path,
-    on_warn: Option<&dyn Fn(&str)>,
-) -> Result<RefreshOutcome, RefreshError>;
-```
-
-```rust
-// store.rs
-pub struct AssetDb {
-    pub schema_version: u16,            // 7
-    pub watchman_clock: Option<String>, // opaque, per Watchman protocol
-    pub script_types: Vec<u128>,
-    pub entries: Vec<AssetEntry>,
-}
-```
+See source for canonical signatures: `Delta` / `WatchError` in
+`watch.rs`, `RefreshOutcome` / `RefreshError` in `refresh.rs`,
+`AssetDb` in `store.rs`.
 
 ## Patch semantics
 
