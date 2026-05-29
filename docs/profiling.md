@@ -20,30 +20,13 @@ Three recipes in the project [justfile]:
 Defaults to `MEOW_CLIENT=/Users/jameskim/Develop/meow-tower`. Override
 via env: `MEOW_CLIENT=/path/to/other/project just profile`.
 
-For a flamegraph, drive [samply] directly (release symbols come from
-the line-tables-only debug info pinned in `Cargo.toml`):
-
-```sh
-cargo build --release
-rm -f /tmp/unity-assetdb-profile/asset-db.bin   # cold only
-samply record --unstable-presymbolicate --save-only \
-  --output /tmp/unity-assetdb-profile/cold.json \
-  target/release/unity-assetdb bake --project "$MEOW_CLIENT" --out-dir /tmp/unity-assetdb-profile
-samply load /tmp/unity-assetdb-profile/cold.json   # opens Firefox Profiler
-```
-
-`--unstable-presymbolicate` emits a `.syms.json` sidecar so the trace
-opens with full symbols even without the binary alongside.
-
 [justfile]: ../justfile
 [hyperfine]: https://github.com/sharkdp/hyperfine
-[samply]: https://github.com/mstange/samply
 
 ## Quick start
 
 ```sh
 brew install hyperfine watchman       # one-time
-cargo install samply                  # one-time (only if flamegraphing)
 
 just profile                          # cold / steady-state / touch+refresh
 ```
@@ -66,7 +49,7 @@ phases now that the mtime cache is gone:
 
 The auto-refresh path orchestrated by `src/refresh.rs`. No internal
 phase counter (yet); profile via `examples/bench_bake.rs::"refresh
-(Watchman empty-delta)"` or attach `samply` to a query invocation.
+(Watchman empty-delta)"`.
 
 Steady-state cost ≈ `store::read` + `watch::since` + (`store::write` if
 the delta is non-empty). Patch cost ≈ steady-state +
@@ -139,33 +122,22 @@ documented in `cache_does_not_detect_asset_only_touch` is gone).
 - **Daemon-mode unity-assetdb** — collapses process startup + bin load
   to ~0; ~hundreds of LOC of IPC + lifecycle. See `TODO.md`.
 
-## Flamegraph reading
+## Where the cost goes
 
-Open the samply JSON with `samply load <path>` to launch Firefox
-Profiler.
+The cold path is ~85% syscall I/O (`read`, `__open`, `stat`) — the
+full-bake walk + parse + dedup pipeline. The `refresh` warm path shifts
+the cost to Watchman IPC (tokio runtime startup + a single async block
+on the BSER socket); no useful Rust-level hotspots there.
 
-### What dominates each path
-
-The cold flamegraph is ~85% syscall I/O (`read`, `__open`, `stat`) —
-the full-bake walk + parse + dedup pipeline. The `refresh` warm path
-shifts the cost to Watchman IPC: a warm trace shows tokio runtime
-startup + a single async block on the BSER socket, no useful
-Rust-level hotspots.
-
-### Rust-CPU symbols to recognize
-
-These are the parser/build hotspots that surface once syscall I/O
-recedes (warm-OS cold runs, or warm-bake parse-miss runs):
+The parser/build hotspots on the bake path:
 
 - `meta::parse` — line-oriented scan of every `.meta`. Hot when the
   project is sprite-heavy.
 - `asset::parse` — line-oriented YAML peek for the WithSubAssets
   extensions (`.prefab`/`.controller`/`.anim`/`.mixer`/`.playable`/
   `.asset`/`.spriteatlas*`). Hot for prefab-heavy projects.
+- `build_db`'s hashmap churn (`ahash::AHasher`) — ~17 ms on warm bake.
 - `bincode::decode_from_slice` — bin load on every query path.
-
-`build_db`'s hashmap churn appears as `ahash::AHasher` callers; ~17 ms
-total on warm bake, ~thin in the flamegraph.
 
 ## When to re-profile
 

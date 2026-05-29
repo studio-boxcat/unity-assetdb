@@ -3,7 +3,7 @@
 > **Related:** [`docs/asset-database.md`](docs/asset-database.md) (storage
 > schema + bake pipeline) · [`docs/refresh.md`](docs/refresh.md) (Watchman-
 > driven incremental refresh) · [`docs/profiling.md`](docs/profiling.md)
-> (wall-clock baselines + samply recipe).
+> (wall-clock baselines + phase breakdown).
 
 Walks a Unity project's `Assets/` tree, parses `.meta` and asset YAML, and writes a
 compact bincode index that maps asset GUIDs (and sub-asset fileIDs) to human-readable
@@ -102,9 +102,9 @@ refreshes converge on the next query via Watchman replay. See
 
 ## Profiling
 
-`just profile` (hyperfine cold/warm + phase breakdown). For flamegraphs,
-drive `samply record` directly — see [`docs/profiling.md`](docs/profiling.md)
-for the invocation, baseline numbers, and per-phase semantics.
+`just profile` (hyperfine cold/warm + phase breakdown) — see
+[`docs/profiling.md`](docs/profiling.md) for the recipes, baseline
+numbers, and per-phase semantics.
 
 ## Status
 

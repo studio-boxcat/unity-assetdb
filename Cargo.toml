@@ -52,6 +52,6 @@ tokio = { version = "1", default-features = false, features = ["rt", "net"] }
 # `predicates` transitively for the stdout/stderr matchers.
 assert_cmd = "2"
 
-# Keep line tables in release so samply can symbolicate flamegraphs.
+# Keep line tables in release for readable backtraces / profiler symbols.
 [profile.release]
 debug = "line-tables-only"
