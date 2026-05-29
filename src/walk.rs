@@ -381,17 +381,14 @@ fn walk_dir_collect(
     Ok(())
 }
 
-/// Shared `WalkBuilder` config for every asset walk in this crate.
+/// `WalkBuilder` preconfigured with Unity's hidden-file rule — the
+/// reusable primitive for any tool that walks a Unity project tree.
 ///
-/// `standard_filters(false)`: gitignore parsing in a Unity project is a
-/// net loss — `Library/` + `Temp/` + build artifacts live outside
-/// `Assets/` and `Packages/`. Inside-Assets `.gitignore` files exist
-/// (Zenject codegen, scratch dirs, SmartLibrary `.asset` exclusions)
-/// but Unity doesn't honor them either — gitignored `.meta` files
-/// still carry guids that prefabs can reference, so the asset DB must
-/// include them. See [Walker ignore behavior](docs/asset-database.md#populating).
-/// `is_unity_hidden` covers `.foo` and `foo~` per Unity's special-folder rule.
-fn asset_walk_builder(root: &Path) -> WalkBuilder {
+/// `standard_filters(false)` because Unity doesn't honor `.gitignore`
+/// either — gitignored `.meta` files still carry guids prefabs reference.
+/// `is_unity_hidden` covers `.foo` / `foo~` per Unity's special-folder rule.
+/// See [Walker ignore behavior](docs/asset-database.md#populating).
+pub fn asset_walk_builder(root: &Path) -> WalkBuilder {
     let mut b = WalkBuilder::new(root);
     b.standard_filters(false)
         .follow_links(false)
