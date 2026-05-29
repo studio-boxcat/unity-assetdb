@@ -136,27 +136,20 @@ documented in `cache_does_not_detect_asset_only_touch` is gone).
   mapped file removes the 5 ms decode. ~150 LOC + a fixed-layout
   schema; significant work for a fixed-cost saving the user can't
   perceive at ~120 ms wall.
-- **Daemon-mode unity-assetdb** — collapse process startup + bin load
-  to ~0 by keeping the AssetDb in memory across invocations. ~hundreds
-  of LOC of IPC + lifecycle. Only justified if someone hits a real
-  sub-10 ms latency requirement (IDE plugin, build-system loop). See
-  TODO.md.
+- **Daemon-mode unity-assetdb** — collapses process startup + bin load
+  to ~0; ~hundreds of LOC of IPC + lifecycle. See `TODO.md`.
 
 ## Flamegraph reading
 
 Open the samply JSON with `samply load <path>` to launch Firefox
 Profiler.
 
-### Deep profile (2026-05-11, pre-overhaul — historical)
+### What dominates each path
 
-The pre-overhaul cold flamegraph showed ~85% syscall I/O (`read`,
-`__open`, `stat`). The post-overhaul cold path is structurally
-identical — same full-bake walk + parse + dedup pipeline — so the
-same symbols dominate.
-
-The new addition is the `refresh` warm path, where the cost shifts
-from in-process Rust to Watchman IPC. A warm trace there shows tokio
-runtime startup + a single async block on the BSER socket. No useful
+The cold flamegraph is ~85% syscall I/O (`read`, `__open`, `stat`) —
+the full-bake walk + parse + dedup pipeline. The `refresh` warm path
+shifts the cost to Watchman IPC: a warm trace shows tokio runtime
+startup + a single async block on the BSER socket, no useful
 Rust-level hotspots.
 
 ### Rust-CPU symbols to recognize

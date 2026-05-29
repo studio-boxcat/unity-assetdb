@@ -59,7 +59,7 @@ pub const MAGIC: [u8; 8] = *b"UADBIN__";
 /// `Native(classId)` for built-in types (Sprite, Prefab, Texture2D, …).
 /// `Script(idx)` for MonoBehaviour-backed assets — `idx` indexes into
 /// [`AssetDb::script_types`], whose entries are u128 script GUIDs that
-/// match the `guid` field on entries in `types.json`.
+/// match the `guid` field of the corresponding `.cs.meta`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum AssetType {
     Native(u32),
@@ -108,9 +108,8 @@ pub struct AssetEntry {
     pub name: Box<str>,
     pub sub_assets: Vec<SubAsset>,
     /// Project-root-relative path (`Assets/Foo.prefab`,
-    /// `Packages/com.boxcat.libs/Bar.mixer`). Convert-side uses this so
-    /// `SourcePrefabResolver` can locate base prefabs by guid without
-    /// re-walking the project tree.
+    /// `Packages/com.boxcat.libs/Bar.mixer`). Lets downstream consumers
+    /// locate assets by guid without re-walking the project tree.
     pub hint: Box<str>,
 }
 

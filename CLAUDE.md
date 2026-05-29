@@ -27,7 +27,9 @@ query pipeline below). One sub-crate lives under `crates/`:
   specific exclusions (e.g. `is_blacklisted_extension` for this crate's name
   pool) stay private to `unity-assetdb`.
 
-## Crate layout
+## Modules
+
+The single root crate `unity-assetdb` (everything under `src/`) splits into:
 
 - `store` — on-disk schema (`AssetDb` with `watchman_clock` header,
   `AssetEntry`, `SubAsset`, `AssetType`).
@@ -49,8 +51,8 @@ query pipeline below). One sub-crate lives under `crates/`:
 - `usage` — scan project YAML for files referencing a given GUID
   (`find_usages`, `UsageMatch`). Native substitute for `rg <hex>` that
   knows which extensions are Unity YAML.
-- `builtin` — Unity engine-builtin GUID predicates (`is_builtin`,
-  bucket discrimination). These all-zeros-except-one-hex GUIDs identify
+- `builtin` — Unity engine-builtin GUID predicates (shape + bucket
+  discrimination). These all-zeros-except-one-hex GUIDs identify
   assets baked into the engine binary — never in `Assets/`.
 
 ## CLI
@@ -83,10 +85,8 @@ Without `--project`, walks up from the cwd until both `Assets/` and `ProjectSett
 are found. Without `--out-dir`, writes to `<project>/Library/unity-assetdb/`.
 
 **Auto-refresh.** Every query subcommand transparently refreshes the bin
-via [Watchman](docs/refresh.md) before serving its answer. See
-[[refresh.md]] for the decision tree (bin-missing → full bake, empty
-delta → clock-only, small delta → patch, large/fresh → full bake,
-Watchman absent → full bake + stderr nudge).
+via [Watchman](docs/refresh.md) before serving its answer — see
+[[refresh.md]] for the decision tree.
 
 Names containing `/` or `^` in source YAML **hard-fail** at bake time.
 See [[asset-database.md#reserved-character-policy]].
@@ -95,12 +95,10 @@ Output discipline: data → stdout, warnings / suggestions / progress → stderr
 TSV cells escape `\t`/`\n`/`\\`. JSON output is one object per line.
 
 `bake` and `register` share an advisory flock on
-`<out_dir>/.asset-db.lock` so concurrent writers don't clobber the
-bin. `refresh::refresh` deliberately skips the flock on the patch
-path — a lost-update race between concurrent refreshes converges on
-the next query via Watchman replay, and the simpler unlocked path
-wins. (See [`refresh.md`](docs/refresh.md) and the comment in
-`bake_inner` for the deadlock breadcrumb.)
+`<out_dir>/.asset-db.lock` so concurrent writers don't clobber the bin.
+`refresh::refresh` skips the flock on the patch path — concurrent
+refreshes converge on the next query via Watchman replay. See
+[[refresh.md]] and the `bake_inner` deadlock breadcrumb.
 
 ## Profiling
 
@@ -111,17 +109,14 @@ for the invocation, baseline numbers, and per-phase semantics.
 ## Status
 
 - **API stability:** pre-1.0; signatures may shift.
-- **Errors:** public API returns typed `thiserror` errors —
-  `StoreError`, `MetaParseError`, `WalkError`, `BakeError`, `QueryError`,
-  `RegisterError`. `BakeError` and `RegisterError` expose
-  `Store(StoreError)` variants for matching + `Other(anyhow::Error)` for
-  chained context. Internal helpers in `bake.rs` still use `anyhow::Result`
-  for ergonomic context chaining; the typed boundary is `pub fn bake` /
-  `pub fn parse_one` / `pub fn register`.
-- **Minimal-meta assumption (shared by `register` + `bake`'s
-  missing-meta pre-pass):** synthesizes the `<Importer>:` block with
-  only `externalObjects`/`userData`/`assetBundleName`/
-  `assetBundleVariant` fields. Unity, on next editor focus, re-imports
-  the asset and rewrites the importer block with project defaults **while
-  preserving the GUID**. If a specific importer config is needed (atlas
-  packables, texture platform overrides), edit in Unity after focus.
+- **Errors:** the public boundary (`bake` / `parse_one` / `register` /
+  queries) returns typed per-module `thiserror` errors; `BakeError` and
+  `RegisterError` expose a `Store(_)` variant for matching plus
+  `Other(anyhow::Error)` for chained context. Internal `bake.rs` helpers
+  stay on `anyhow::Result`.
+- **Minimal-meta assumption (`register` + `bake`'s missing-meta pre-pass):**
+  synthesizes only the importer block's `externalObjects` / `userData` /
+  `assetBundleName` / `assetBundleVariant` fields. Unity re-imports and
+  rewrites it with project defaults on next editor focus **while preserving
+  the GUID** — edit in Unity afterward if you need a specific importer
+  config (atlas packables, texture platform overrides).

@@ -1,34 +1,6 @@
 # TODO
 
-## Shipped
-
-- **~~Watchman-driven incremental bake (replaces `BakeCache`).~~** ✅
-  Shipped 2026-05-21. `BakeCache` / `cache.bin` / mtime-tracking stack
-  removed; opaque Watchman clock token now lives in the `AssetDb`
-  header. Auto-refresh wired into every query subcommand via
-  `refresh::refresh`. Meow-tower steady-state ≈ 120 ms / patched
-  ≈ 150 ms / cold full bake ≈ 1 s. See [[docs/refresh.md]] for the
-  design; numbers + microbench in [[docs/profiling.md]].
-- **~~CLI integration tests.~~** ✅ `tests/cli.rs` covers the stdout /
-  stderr / exit-code contract for every subcommand (`bake`, `find`,
-  `alias`, `guid`, `path`, `list`, `usage`) using `assert_cmd`. 17
-  tests pin TSV + `--json` output shape, "did you mean:" suggestions
-  on miss, and the auto-bake-on-missing-bin path.
-- **~~Clippy `doc_lazy_continuation`.~~** ✅ Fixed in `src/store.rs` +
-  `tests/bake.rs`. `cargo clippy --all-targets -- -D warnings` is
-  clean.
-- **~~`unity-path-rules` I/O predicate tests.~~** ✅ Tempdir-based
-  tests for `is_submodule_root` (`.git` directory vs gitlink-file vs
-  absent) + `is_opaque_subtree` (four-corner OR coverage). No new
-  dev-deps; uses the same `unique_tmp` pattern as the rest of the
-  workspace.
-- **~~`unity-path-rules` publish dep gap.~~** ✅ Resolved via
-  `justfile`'s new `publish` + `publish-dry-run` recipes. The
-  ergonomic answer keeps the `version = "0.1"` field (correct for
-  crates.io publish) and adds an ordered two-step recipe that
-  publishes the sub-crate first, then the root. Manual prereq:
-  `cargo login`. Run `just publish-dry-run` for safe validation,
-  `just publish` to release.
+_Shipped work lives in git history; this file tracks only deferred items._
 
 ## Deferred (intentional — wait for a use case)
 
