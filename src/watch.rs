@@ -1,55 +1,16 @@
-//! Watchman wire layer.
+//! Watchman wire layer — thin wrapper over the shared [`unity_watch`] crate.
 //!
 //! See [`docs/refresh.md`](../../docs/refresh.md) for how this fits into
-//! the auto-refresh pipeline.
-//!
-//! Sync facade — internally builds a current-thread tokio runtime per
-//! call (~µs cost; one call per CLI invocation). Keeps tokio confined
-//! to this module so the rest of the crate stays sync.
+//! the auto-refresh pipeline. The generic `since`/`Delta`/`WatchError`
+//! machinery (sync facade over `watchman_client`) lives in the standalone
+//! [`unity-watch`](https://github.com/studio-boxcat/unity-watch) crate; this
+//! module only pins the project-specific [`Filter`] — which dirs +
+//! extensions the GUID baker cares about.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use watchman_client::Error as WatchmanError;
-use watchman_client::prelude::*;
-
-/// Result of a `since` query.
-///
-/// Two structural outcomes. Anything else (no daemon, daemon error)
-/// surfaces via [`WatchError`].
-#[derive(Debug)]
-pub enum Delta {
-    /// Watchman returned `is_fresh_instance` — daemon restart, journal
-    /// loss, brand-new watch. Caller must full-bake.
-    Fresh { new_clock: String },
-    /// Steady-state delta. `hints` is the list of project-relative
-    /// paths that changed (added, modified, or deleted — the patcher
-    /// disambiguates by stat'ing each one). May be empty.
-    Touched {
-        hints: Vec<String>,
-        new_clock: String,
-    },
-}
-
-/// Errors from [`since`]. Both variants collapse to "full bake" at the
-/// orchestrator; the split lets it print a one-line nudge for
-/// `Unavailable` (suggest `brew install watchman`) and a different
-/// log line for `Query` (which is exceptional, not a missing tool).
-#[derive(Debug, thiserror::Error)]
-pub enum WatchError {
-    /// Watchman CLI not found, daemon socket unreachable, or discovery
-    /// failed. The user-facing "you should install watchman" branch.
-    #[error("watchman unavailable")]
-    Unavailable,
-    /// Anything else — BSER decode, query rejected, transport error.
-    /// Exceptional; orchestrator logs and falls back to full bake.
-    #[error("watchman query failed: {0}")]
-    Query(#[from] anyhow::Error),
-}
-
-// `NameOnly` deserializes directly from the `name` string and is the
-// cheapest field set Watchman supports. We don't need `exists` — the
-// patcher stats each hint itself to decide delete-vs-parse, so the
-// extra column is just bytes on the wire.
+use unity_watch::Filter;
+pub use unity_watch::{Delta, WatchError};
 
 /// File suffixes Watchman should report changes for. Drives the
 /// `Suffix` filter so we never see `Library/`, `Temp/`, or build
@@ -80,118 +41,20 @@ const SUFFIXES: &[&str] = &[
 /// scan to these subtrees of the resolved root.
 const TOPLEVEL_DIRS: &[&str] = &["Assets", "Packages", "ProjectSettings"];
 
-/// Query Watchman for everything that changed under `project_root`
-/// since `prev_clock`. See [`Delta`] for the result shape and
-/// [`WatchError`] for failure modes.
+/// Query Watchman for everything (matching the GUID-baker [`Filter`])
+/// that changed under `project_root` since `prev_clock`. See [`Delta`]
+/// for the result shape and [`WatchError`] for failure modes.
 ///
 /// `prev_clock`: pass `None` for the first call on a project (Watchman
 /// returns a `Fresh` delta with the new clock; orchestrator treats it
 /// as full-bake). Pass `Some(s)` with a clock from a prior call to get
 /// an incremental delta.
-pub fn since(
-    project_root: &Path,
-    prev_clock: Option<&str>,
-) -> Result<Delta, WatchError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-        .map_err(|e| {
-            WatchError::Query(anyhow::Error::new(e).context("build tokio runtime"))
-        })?;
-    rt.block_on(since_inner(project_root, prev_clock))
-}
-
-async fn since_inner(
-    project_root: &Path,
-    prev_clock: Option<&str>,
-) -> Result<Delta, WatchError> {
-    let client = Connector::new().connect().await.map_err(map_connect_err)?;
-
-    let canonical = CanonicalPath::canonicalize(project_root).map_err(|e| {
-        WatchError::Query(anyhow::Error::new(e).context("canonicalize project_root"))
-    })?;
-    let resolved = client
-        .resolve_root(canonical)
-        .await
-        .map_err(|e| WatchError::Query(anyhow::Error::new(e)))?;
-
-    let expression = Expr::All(vec![
-        Expr::Any(
-            TOPLEVEL_DIRS
-                .iter()
-                .map(|d| {
-                    Expr::DirName(DirNameTerm {
-                        path: PathBuf::from(d),
-                        depth: None,
-                    })
-                })
-                .collect(),
-        ),
-        Expr::Suffix(SUFFIXES.iter().map(PathBuf::from).collect()),
-    ]);
-
-    let request = QueryRequestCommon {
-        since: prev_clock
-            .map(|c| Clock::Spec(ClockSpec::StringClock(c.to_owned()))),
-        expression: Some(expression),
-        ..Default::default()
-    };
-
-    let result = client
-        .query::<NameOnly>(&resolved, request)
-        .await
-        .map_err(|e| WatchError::Query(anyhow::Error::new(e)))?;
-
-    let new_clock = clock_to_string(result.clock)?;
-
-    if result.is_fresh_instance {
-        return Ok(Delta::Fresh { new_clock });
-    }
-
-    let hints: Vec<String> = result
-        .files
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|row| {
-            // Watchman returns paths relative to the watch root. With
-            // `relative_root` auto-set from ResolvedRoot, they're
-            // relative to the project root — which is exactly the
-            // shape our `hint` strings use.
-            row.name.into_inner().into_os_string().into_string().ok()
-        })
-        .collect();
-
-    Ok(Delta::Touched { hints, new_clock })
-}
-
-fn clock_to_string(clock: Clock) -> Result<String, WatchError> {
-    match clock {
-        Clock::Spec(ClockSpec::StringClock(s)) => Ok(s),
-        // UnixTimestamp clocks aren't emitted by the server in normal
-        // operation; we requested a string-clock-shaped `since`.
-        Clock::Spec(ClockSpec::UnixTimestamp(t)) => Ok(t.to_string()),
-        // We don't request SCM-aware queries; if the server volunteered
-        // one, something's wrong upstream. Surface it as a Query error
-        // so the orchestrator full-bakes; better than silently dropping
-        // the scm metadata and continuing with a partial clock.
-        Clock::ScmAware(_) => Err(WatchError::Query(anyhow::anyhow!(
-            "watchman returned an SCM-aware clock; not requested",
-        ))),
-    }
-}
-
-/// Watchman returns very different errors for "binary not installed"
-/// (`ConnectionDiscovery`, from the CLI subprocess used to find the
-/// socket) vs. "daemon not running" (`Connect`, from the socket open).
-/// We treat both as "unavailable" — the user-facing fix is the same
-/// (`brew install watchman` or restart the daemon).
-fn map_connect_err(e: WatchmanError) -> WatchError {
-    match e {
-        WatchmanError::ConnectionDiscovery { .. } | WatchmanError::Connect { .. } => {
-            WatchError::Unavailable
-        }
-        other => WatchError::Query(anyhow::Error::new(other)),
-    }
+pub fn since(project_root: &Path, prev_clock: Option<&str>) -> Result<Delta, WatchError> {
+    unity_watch::since(
+        project_root,
+        prev_clock,
+        &Filter::new(TOPLEVEL_DIRS, SUFFIXES),
+    )
 }
 
 #[cfg(test)]
@@ -273,5 +136,4 @@ mod tests {
         // path). Both fine — assertion is that we got an Err.
         assert!(result.is_err(), "expected Err for non-existent path");
     }
-
 }

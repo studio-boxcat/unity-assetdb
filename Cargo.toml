@@ -40,10 +40,10 @@ tempfile = "3"
 thiserror = "2"
 unity-path-rules = { version = "0.1", path = "crates/unity-path-rules" }
 clap = { version = "4", features = ["derive"], optional = true }
-# Watchman client + a minimal tokio runtime to drive its async API.
-# See docs/refresh.md for the sync-facade pattern.
-watchman_client = "0.9"
-tokio = { version = "1", default-features = false, features = ["rt", "net"] }
+# Shared Watchman wire layer (sync facade over watchman_client). `watch.rs`
+# only pins the GUID-baker dir/suffix filter on top of this. See
+# docs/refresh.md for the sync-facade pattern.
+unity-watch = { git = "https://github.com/studio-boxcat/unity-watch.git" }
 
 [dev-dependencies]
 # `assert_cmd` drives the binary as a subprocess for the CLI contract
