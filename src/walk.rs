@@ -52,14 +52,28 @@ pub fn resolve_project_root(arg: Option<&Path>) -> Result<PathBuf, WalkError> {
         return Ok(p);
     }
     let cwd = std::env::current_dir().map_err(WalkError::GetCwd)?;
-    let mut cur: &Path = &cwd;
+    find_project_root(&cwd)
+}
+
+/// Walk up from `start` (inclusive) to the nearest Unity project root — the
+/// first ancestor containing both `Assets/` and `ProjectSettings/`.
+///
+/// Use this when you hold a path *inside* a project (an asset, a `.tps`, the
+/// cwd) and need its root. [`resolve_project_root`] with `Some` instead
+/// validates that the path already *is* the root and does not climb.
+pub fn find_project_root(start: &Path) -> Result<PathBuf, WalkError> {
+    let mut cur: &Path = start;
     loop {
         if is_project(cur) {
             return Ok(cur.to_path_buf());
         }
         match cur.parent() {
             Some(p) => cur = p,
-            None => return Err(WalkError::NoProjectRoot { cwd: cwd.clone() }),
+            None => {
+                return Err(WalkError::NoProjectRoot {
+                    cwd: start.to_path_buf(),
+                });
+            }
         }
     }
 }
