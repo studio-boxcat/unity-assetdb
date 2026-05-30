@@ -4,6 +4,8 @@
 //! TextureImporter mode fields the bake needs to recognize Single-mode
 //! Sprite textures.
 
+use crate::guid::Guid;
+
 /// Errors from `.meta` parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum MetaParseError {
@@ -24,8 +26,8 @@ pub const SPRITE_MODE_SINGLE: u32 = 1;
 /// Parsed contents of a `.meta` file.
 #[derive(Debug, Clone, Default)]
 pub struct MetaInfo {
-    /// 32-hex GUID parsed as u128.
-    pub guid: u128,
+    /// Top-level asset GUID.
+    pub guid: Guid,
     /// Texture sprite-sheet sub-assets, if the importer is TextureImporter
     /// with sprite mode = Multiple. `(file_id, name)` pairs.
     pub sprite_sheet: Vec<(i64, String)>,
@@ -50,7 +52,7 @@ pub struct MetaInfo {
 /// `MissingGuid` (caller can fall back to [`parse`] if that matters).
 ///
 /// O(1) — a handful of byte compares + one `u128::from_str_radix`.
-pub fn parse_guid(text: &str) -> Result<u128, MetaParseError> {
+pub fn parse_guid(text: &str) -> Result<Guid, MetaParseError> {
     let after_bom = text.strip_prefix('\u{feff}').unwrap_or(text);
     let after_ver = after_bom
         .strip_prefix("fileFormatVersion: 2")
@@ -71,14 +73,16 @@ pub fn parse_guid(text: &str) -> Result<u128, MetaParseError> {
     if !rest.starts_with('\n') && !rest.starts_with('\r') {
         return Err(MetaParseError::MissingGuid);
     }
-    u128::from_str_radix(hex, 16).map_err(|_| MetaParseError::MissingGuid)
+    u128::from_str_radix(hex, 16)
+        .map(Guid::from_u128)
+        .map_err(|_| MetaParseError::MissingGuid)
 }
 
 /// [`parse_guid`] direct from disk — reads only the header prefix the
 /// canonical layout reaches into (BOM + `fileFormatVersion: 2` + EOL +
 /// `guid: <32hex>` + trailing EOL byte = at most 64 bytes), avoiding a
 /// full-file load for callers that just want the GUID.
-pub fn read_guid(path: &std::path::Path) -> Result<u128, MetaParseError> {
+pub fn read_guid(path: &std::path::Path) -> Result<Guid, MetaParseError> {
     use std::io::Read;
     // 64 = 3 (BOM) + 20 ("fileFormatVersion: 2") + 2 ("\r\n") + 6 ("guid: ")
     //    + 32 (hex) + 1 (EOL we assert in parse_guid).
@@ -140,7 +144,7 @@ pub fn parse(text: &str) -> Result<MetaInfo, MetaParseError> {
             if hex.len() == 32
                 && let Ok(g) = u128::from_str_radix(hex, 16)
             {
-                info.guid = g;
+                info.guid = Guid::from_u128(g);
                 have_guid = true;
             }
         } else if info.texture_type.is_none()
@@ -213,7 +217,7 @@ mod tests {
     fn parses_simple_guid() {
         let text = "fileFormatVersion: 2\nguid: 7d602c2080b53413fa393df6b2c0af43\n";
         let info = parse(text).unwrap();
-        assert_eq!(info.guid, 0x7d602c2080b53413fa393df6b2c0af43_u128);
+        assert_eq!(info.guid, Guid::from_u128(0x7d602c2080b53413fa393df6b2c0af43_u128));
         assert!(info.sprite_sheet.is_empty());
     }
 
@@ -226,7 +230,7 @@ mod tests {
     #[test]
     fn parse_guid_handles_all_corpus_variants() {
         // Four header layouts seen in meow-tower /Assets (17,418 metas).
-        let g = 0x7d602c2080b53413fa393df6b2c0af43_u128;
+        let g = Guid::from_u128(0x7d602c2080b53413fa393df6b2c0af43_u128);
         let plain_lf = "fileFormatVersion: 2\nguid: 7d602c2080b53413fa393df6b2c0af43\n";
         let plain_crlf = "fileFormatVersion: 2\r\nguid: 7d602c2080b53413fa393df6b2c0af43\r\n";
         let bom_lf = "\u{feff}fileFormatVersion: 2\nguid: 7d602c2080b53413fa393df6b2c0af43\n";
@@ -248,7 +252,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
         assert_eq!(
             read_guid(&p).unwrap(),
-            0x7d602c2080b53413fa393df6b2c0af43_u128,
+            Guid::from_u128(0x7d602c2080b53413fa393df6b2c0af43_u128),
         );
     }
 
@@ -400,7 +404,7 @@ TextureImporter:
     fn crlf_line_endings() {
         let text = "fileFormatVersion: 2\r\nguid: 7d602c2080b53413fa393df6b2c0af43\r\nTextureImporter:\r\n  textureType: 8\r\n  spriteMode: 1\r\n";
         let info = parse(text).unwrap();
-        assert_eq!(info.guid, 0x7d602c2080b53413fa393df6b2c0af43_u128);
+        assert_eq!(info.guid, Guid::from_u128(0x7d602c2080b53413fa393df6b2c0af43_u128));
         assert_eq!(info.texture_type, Some(8));
         assert_eq!(info.sprite_mode, Some(1));
     }

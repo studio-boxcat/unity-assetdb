@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use unity_assetdb::Guid;
 use unity_assetdb::bake::{BakeOptions, bake};
-use unity_assetdb::query;
 use unity_assetdb::register::{ImporterKind, RegisterError, RegisterOptions, register};
 use unity_assetdb::store;
 
@@ -83,11 +83,11 @@ fn register_new_asset_synthesizes_meta_and_inserts_db() {
     let outcome = register(&register_opts(&root, &out_dir, target.clone())).unwrap();
     assert!(outcome.created_meta);
     assert!(outcome.db_updated);
-    assert_ne!(outcome.guid, 0);
+    assert_ne!(outcome.guid, Guid::from_u128(0));
 
     // Meta on disk holds the printed GUID.
     let meta_text = fs::read_to_string(target.with_extension("asset.meta")).unwrap();
-    let expected = format!("guid: {}", query::format_guid(outcome.guid));
+    let expected = format!("guid: {}", outcome.guid.to_string());
     assert!(meta_text.contains(&expected), "meta text: {meta_text}");
     assert!(meta_text.contains("NativeFormatImporter:"));
 
@@ -100,7 +100,7 @@ fn register_new_asset_synthesizes_meta_and_inserts_db() {
     match entry.asset_type {
         store::AssetType::Script(idx) => assert_eq!(
             db.script_guid(idx),
-            0xffff7777ffff7777ffff7777ffff7777_u128,
+            Guid::from_u128(0xffff7777ffff7777ffff7777ffff7777_u128),
         ),
         t => panic!("expected Script, got {t:?}"),
     }
@@ -138,7 +138,7 @@ fn register_folder_emits_folder_asset_marker() {
 
     let outcome = register(&register_opts(&root, &out_dir, target.clone())).unwrap();
     assert!(outcome.created_meta);
-    assert_ne!(outcome.guid, 0);
+    assert_ne!(outcome.guid, Guid::from_u128(0));
 
     let meta_text = fs::read_to_string({
         let mut s = target.into_os_string();
@@ -251,7 +251,7 @@ fn register_remaps_existing_script_indices_on_new_intern() {
     };
     assert_eq!(
         db.script_guid(high_idx),
-        0xffffffffffffffffffffffffffffffff_u128,
+        Guid::from_u128(0xffffffffffffffffffffffffffffffff_u128),
     );
 
     // Second asset has a script GUID with a LOWER sort key — its sorted
@@ -271,7 +271,7 @@ fn register_remaps_existing_script_indices_on_new_intern() {
     match high_after.asset_type {
         store::AssetType::Script(idx) => assert_eq!(
             db.script_guid(idx),
-            0xffffffffffffffffffffffffffffffff_u128,
+            Guid::from_u128(0xffffffffffffffffffffffffffffffff_u128),
             "high-script entry's idx was not remapped after low-script intern",
         ),
         t => panic!("expected Script, got {t:?}"),
@@ -297,7 +297,7 @@ fn register_meta_lookup_idempotent_inserts_missing_db_row() {
     let outcome = register(&register_opts(&root, &out_dir, target)).unwrap();
     assert!(!outcome.created_meta, "meta already existed");
     assert!(outcome.db_updated, "missing db row should be inserted");
-    assert_eq!(outcome.guid, 0xcafebabecafebabecafebabecafebabe_u128);
+    assert_eq!(outcome.guid, Guid::from_u128(0xcafebabecafebabecafebabecafebabe_u128));
 
     let db = store::read(&store::db_path(&out_dir)).unwrap();
     assert!(db.find_by_guid(outcome.guid).is_some());

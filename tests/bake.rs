@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use unity_assetdb::Guid;
 use unity_assetdb::bake::{BakeOptions, bake};
 use unity_assetdb::store;
 
@@ -120,7 +121,7 @@ fn bake_then_load_roundtrip() {
 
     // Foo.prefab
     let foo = db
-        .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+        .find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
         .expect("Foo.prefab missing");
     assert_eq!(&*foo.name, "Foo.prefab");
     match foo.asset_type {
@@ -134,12 +135,12 @@ fn bake_then_load_roundtrip() {
 
     // Bar.asset → Script(...) referencing the script guid.
     let bar = db
-        .find_by_guid(0xcccc3333cccc3333cccc3333cccc3333_u128)
+        .find_by_guid(Guid::from_u128(0xcccc3333cccc3333cccc3333cccc3333_u128))
         .expect("Bar.asset missing");
     assert_eq!(&*bar.name, "Bar.asset");
     match bar.asset_type {
         store::AssetType::Script(idx) => {
-            assert_eq!(db.script_guid(idx), 0xbbbb2222bbbb2222bbbb2222bbbb2222_u128);
+            assert_eq!(db.script_guid(idx), Guid::from_u128(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128));
         }
         store::AssetType::Native(_) => {
             panic!("expected Script for Bar, got {:?}", bar.asset_type)
@@ -148,7 +149,7 @@ fn bake_then_load_roundtrip() {
 
     // Sheet.png → Native(Texture2D), 2 sub-assets.
     let sheet = db
-        .find_by_guid(0xdddd4444dddd4444dddd4444dddd4444_u128)
+        .find_by_guid(Guid::from_u128(0xdddd4444dddd4444dddd4444dddd4444_u128))
         .expect("Sheet.png missing");
     assert_eq!(&*sheet.name, "Sheet.png");
     match sheet.asset_type {
@@ -164,7 +165,7 @@ fn bake_then_load_roundtrip() {
     assert_eq!(&*sheet.sub_assets[1].name, "spr_b");
 
     // Entries are guid-sorted on disk.
-    let guids: Vec<u128> = db.entries.iter().map(|e| e.guid).collect();
+    let guids: Vec<Guid> = db.entries.iter().map(|e| e.guid).collect();
     let mut sorted = guids.clone();
     sorted.sort_unstable();
     assert_eq!(guids, sorted);
@@ -217,8 +218,8 @@ fn rebake_preserves_hint() {
         assert_eq!(cold.entries.len(), warm.entries.len());
         for (c, w) in cold.entries.iter().zip(warm.entries.iter()) {
             assert_eq!(c.guid, w.guid);
-            assert!(!w.hint.is_empty(), "re-bake hint went empty for guid {:032x}", w.guid);
-            assert_eq!(&*c.hint, &*w.hint, "re-bake hint drifted for guid {:032x}", w.guid);
+            assert!(!w.hint.is_empty(), "re-bake hint went empty for guid {}", w.guid);
+            assert_eq!(&*c.hint, &*w.hint, "re-bake hint drifted for guid {}", w.guid);
         }
     }
 
@@ -299,7 +300,7 @@ fn rebake_round_trips_sub_assets() {
     let cold_sheet = cold
         .entries
         .iter()
-        .find(|e| e.guid == 0xdddd4444dddd4444dddd4444dddd4444_u128)
+        .find(|e| e.guid == Guid::from_u128(0xdddd4444dddd4444dddd4444dddd4444_u128))
         .expect("Sheet.png missing from first bake");
     assert_eq!(
         cold_sheet.sub_assets.len(),
@@ -313,7 +314,7 @@ fn rebake_round_trips_sub_assets() {
     let warm_sheet = warm
         .entries
         .iter()
-        .find(|e| e.guid == 0xdddd4444dddd4444dddd4444dddd4444_u128)
+        .find(|e| e.guid == Guid::from_u128(0xdddd4444dddd4444dddd4444dddd4444_u128))
         .expect("Sheet.png missing from re-bake");
     assert_eq!(warm_sheet.sub_assets.len(), 2);
     for (c, w) in cold_sheet.sub_assets.iter().zip(warm_sheet.sub_assets.iter()) {
@@ -494,7 +495,7 @@ TextureImporter:
     let _out_dir = bake_at(&root);
     let db = store::read(&db_file(&root)).unwrap();
     let entry = db
-        .find_by_guid(0xeeee5555eeee5555eeee5555eeee5555_u128)
+        .find_by_guid(Guid::from_u128(0xeeee5555eeee5555eeee5555eeee5555_u128))
         .expect("Icon.png missing from db");
 
     assert_eq!(&*entry.name, "Icon.png");
@@ -553,7 +554,7 @@ DefaultImporter:
     let db = store::read(&db_file(&root)).unwrap();
 
     let entry = db
-        .find_by_guid(0xc01ef0000864f41bdaacaf9939e97b36_u128)
+        .find_by_guid(Guid::from_u128(0xc01ef0000864f41bdaacaf9939e97b36_u128))
         .expect("DefaultImporter-imported asset missing from db");
     // Always-ext rule: stem `Cat.fla` (Rust's `file_stem` strips only
     // the trailing `.swf`) plus the actual file extension `.swf` →
@@ -627,7 +628,7 @@ fn rebake_drops_entry_when_asset_deleted() {
     let first = store::read(&db_file(&root)).unwrap();
     assert!(
         first
-            .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
             .is_some(),
         "Foo prefab should exist before deletion",
     );
@@ -639,7 +640,7 @@ fn rebake_drops_entry_when_asset_deleted() {
     let second = store::read(&db_file(&root)).unwrap();
     assert!(
         second
-            .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
             .is_none(),
         "deleted Foo prefab still in db",
     );
@@ -708,7 +709,7 @@ fn deeply_nested_assets_are_indexed() {
     let _out_dir = bake_at(&root);
     let db = store::read(&db_file(&root)).unwrap();
     assert!(
-        db.find_by_guid(0xdeadbeefdeadbeefdeadbeefdeadbeef_u128)
+        db.find_by_guid(Guid::from_u128(0xdeadbeefdeadbeefdeadbeefdeadbeef_u128))
             .is_some(),
         "deeply-nested prefab not indexed",
     );
@@ -1150,9 +1151,9 @@ fn bake_excludes_sidecar_md_and_pspec_files() {
         "only the .prefab should be indexed, got: {:?}",
         db.entries.iter().map(|e| &*e.hint).collect::<Vec<_>>(),
     );
-    assert!(db.find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128).is_some());
+    assert!(db.find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)).is_some());
     assert!(
-        db.find_by_guid(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128).is_none(),
+        db.find_by_guid(Guid::from_u128(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128)).is_none(),
         ".md sidecar must not enter the asset-db",
     );
 

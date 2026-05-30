@@ -25,9 +25,9 @@ use anyhow::{Context, Result};
 
 use crate::asset;
 use crate::class_id::{ClassId, class_from_ext};
+use crate::guid::Guid;
 use crate::meta::{self, SPRITE_MODE_SINGLE, TEXTURE_TYPE_SPRITE};
 use crate::store::{self, AssetDb, AssetEntry, AssetType, StoreError, SubAsset, DB_FILENAME};
-use crate::query::format_guid;
 use crate::register::{generate_guid, importer_for_path, render_meta};
 use crate::walk::{walk_for_missing_meta, walk_meta_files, WalkError};
 
@@ -109,7 +109,7 @@ fn is_filterable_subdoc_for_ext(class_id: u32, ext: &str) -> bool {
 /// only need one final sort.
 #[derive(Clone)]
 pub(crate) struct RawEntry {
-    pub(crate) guid: u128,
+    pub(crate) guid: Guid,
     pub(crate) asset_type_raw: AssetTypeRaw,
     pub(crate) hint: String,
     pub(crate) name: String,
@@ -123,7 +123,7 @@ pub(crate) struct RawEntry {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AssetTypeRaw {
     Native(u32),
-    Script(u128),
+    Script(Guid),
 }
 
 /// Public, dedup-free view of a single parsed asset — what [`parse_one`]
@@ -131,7 +131,7 @@ pub(crate) enum AssetTypeRaw {
 /// [`crate::store::AssetDb::intern_script`].
 #[derive(Debug, Clone)]
 pub struct ParsedEntry {
-    pub guid: u128,
+    pub guid: Guid,
     pub asset_type: ParsedAssetType,
     pub hint: String,
     pub sub_assets: Vec<SubAsset>,
@@ -140,7 +140,7 @@ pub struct ParsedEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedAssetType {
     Native(u32),
-    Script(u128),
+    Script(Guid),
 }
 
 /// Per-worker-thread accumulator. Sends its collected `entries` + `errors`
@@ -441,7 +441,7 @@ fn write_minimal_meta(path: &Path, is_dir: bool) -> Result<bool> {
     use std::io::Write;
     let kind = importer_for_path(path, is_dir);
     let guid = generate_guid().map_err(|e| anyhow::anyhow!("generate guid: {e}"))?;
-    let body = render_meta(&format_guid(guid), kind, is_dir);
+    let body = render_meta(&guid.to_string(), kind, is_dir);
     let meta_path = with_meta_suffix(path);
     match std::fs::OpenOptions::new()
         .write(true)
@@ -504,7 +504,7 @@ pub(crate) fn parse_one_raw(
 /// re-apply dedup from scratch. Top-level names are reset from hints
 /// inside `build_db`; sub-asset names have no external source, so this
 /// is the only place to restore them.
-pub(crate) fn raw_from_entry(entry: &AssetEntry, script_types: &[u128]) -> RawEntry {
+pub(crate) fn raw_from_entry(entry: &AssetEntry, script_types: &[Guid]) -> RawEntry {
     let asset_type_raw = match entry.asset_type {
         AssetType::Native(n) => AssetTypeRaw::Native(n),
         AssetType::Script(idx) => AssetTypeRaw::Script(script_types[idx as usize]),
@@ -595,7 +595,7 @@ fn parse_meta_and_asset(
 
     let mut sub_assets: Vec<SubAsset> = Vec::new();
     let mut top_class_id: Option<u32> = None;
-    let mut script_guid: Option<u128> = None;
+    let mut script_guid: Option<Guid> = None;
 
     // YAML peek strategy:
     //  - WithSubAssets: types where extra docs ARE addressable from outside.
@@ -785,7 +785,7 @@ fn build_db(
     // (see [Name collisions](docs/asset-database.md#name-collisions)).
 
     // Pass 1: tally distinct-guid owners per `(name, asset_type)` bucket.
-    let mut owners: AHashMap<(String, AssetTypeRaw), AHashSet<u128>> =
+    let mut owners: AHashMap<(String, AssetTypeRaw), AHashSet<Guid>> =
         AHashMap::with_capacity(raw.len());
     for r in &raw {
         let key = (r.name.clone(), r.asset_type_raw);
@@ -814,7 +814,7 @@ fn build_db(
     // (e.g. hints sharing the same last 2 parent segments); the recorded
     // hint feeds the error so the user sees both colliding paths.
     // Same-guid sharing remains allowed.
-    let mut taken: AHashMap<(String, AssetTypeRaw), (u128, String)> =
+    let mut taken: AHashMap<(String, AssetTypeRaw), (Guid, String)> =
         AHashMap::with_capacity(raw.len());
 
     for r in raw.iter_mut() {
@@ -823,7 +823,7 @@ fn build_db(
             let new_name = collision_suffix(top_type, &r.hint, &r.name, r.guid)?;
             if verbose_collisions && let Some(sink) = on_warn {
                 sink(&format!(
-                    "warning: name collision on `{}` (guid {:032x}); renamed to `{}`",
+                    "warning: name collision on `{}` (guid {}); renamed to `{}`",
                     r.name, r.guid, new_name,
                 ));
             }
@@ -858,7 +858,7 @@ fn build_db(
                 let new_name = collision_suffix(sub_type, &r.hint, &original, r.guid)?;
                 if verbose_collisions && let Some(sink) = on_warn {
                     sink(&format!(
-                        "warning: sub-asset name collision on `{}` (parent guid {:032x}); renamed to `{}`",
+                        "warning: sub-asset name collision on `{}` (parent guid {}); renamed to `{}`",
                         original, r.guid, new_name,
                     ));
                 }
@@ -910,7 +910,7 @@ fn check_no_full_duplicates(db: &AssetDb) -> Result<()> {
     for w in db.entries.windows(2) {
         if w[0].guid == w[1].guid {
             anyhow::bail!(
-                "duplicate top-level GUID: {:032x} between names `{}` and `{}` — likely two .meta files share a GUID",
+                "duplicate top-level GUID: {} between names `{}` and `{}` — likely two .meta files share a GUID",
                 w[0].guid,
                 w[0].name,
                 w[1].name,
@@ -925,7 +925,7 @@ fn check_no_full_duplicates(db: &AssetDb) -> Result<()> {
         for s in &e.sub_assets {
             if !seen.insert((s.file_id, &*s.name)) {
                 anyhow::bail!(
-                    "duplicate sub-asset record: name={} guid={:032x} fileID={} type={:?}",
+                    "duplicate sub-asset record: name={} guid={} fileID={} type={:?}",
                     s.name,
                     e.guid,
                     s.file_id,
@@ -1033,7 +1033,7 @@ fn asset_type_raw_str(t: AssetTypeRaw) -> String {
             Some(c) => c.name().to_string(),
             None => format!("Native:{n}"),
         },
-        AssetTypeRaw::Script(g) => format!("Script:{}", format_guid(g)),
+        AssetTypeRaw::Script(g) => format!("Script:{g}"),
     }
 }
 
@@ -1043,10 +1043,10 @@ fn asset_type_raw_str(t: AssetTypeRaw) -> String {
 /// the recorded hint of the prior claimant feeds the error so the user
 /// sees both colliding paths.
 fn claim(
-    taken: &mut AHashMap<(String, AssetTypeRaw), (u128, String)>,
+    taken: &mut AHashMap<(String, AssetTypeRaw), (Guid, String)>,
     name: &str,
     t: AssetTypeRaw,
-    guid: u128,
+    guid: Guid,
     hint: &str,
 ) -> Result<()> {
     match taken.get(&(name.to_string(), t)) {
@@ -1054,8 +1054,8 @@ fn claim(
         Some((prev_guid, prev_hint)) => anyhow::bail!(
             "asset-db: cannot disambiguate name `{name}` (asset_type {ty}) — \
              two assets share the same depth-{MIN_PARENTS} parent suffix:\n  \
-             {prev_hint} (guid {prev_guid:032x})\n  \
-             {hint} (guid {guid:032x})\n\
+             {prev_hint} (guid {prev_guid})\n  \
+             {hint} (guid {guid})\n\
              Rename one in source.",
             ty = asset_type_raw_str(t),
         ),
@@ -1074,7 +1074,7 @@ fn claim(
 /// sidesteps the problem entirely. Every other asset type gets the
 /// path-based depth-2 suffix where the surrounding directories are
 /// meaningful.
-fn collision_suffix(t: AssetTypeRaw, hint: &str, stem: &str, guid: u128) -> Result<String> {
+fn collision_suffix(t: AssetTypeRaw, hint: &str, stem: &str, guid: Guid) -> Result<String> {
     if matches!(t, AssetTypeRaw::Native(c) if c == ClassId::MonoScript as u32) {
         return Ok(guid_suffix(stem, guid));
     }
@@ -1101,8 +1101,8 @@ const GUID_SUFFIX_LEN: usize = 8;
 /// 8-hex collisions across two distinct GUIDs are exceptionally rare;
 /// when they do happen, [`claim`] still hard-fails — the user can
 /// regenerate one of the colliding script GUIDs to resolve.
-fn guid_suffix(stem: &str, guid: u128) -> String {
-    let hex = format_guid(guid);
+fn guid_suffix(stem: &str, guid: Guid) -> String {
+    let hex = guid.to_string();
     format!("{stem}^{}", &hex[..GUID_SUFFIX_LEN])
 }
 
@@ -1218,7 +1218,7 @@ mod tests {
         sprites: Vec<(i64, String)>,
     ) -> meta::MetaInfo {
         meta::MetaInfo {
-            guid: 0,
+            guid: Guid::from_u128(0),
             sprite_sheet: sprites,
             texture_type,
             sprite_mode,
@@ -1348,10 +1348,10 @@ mod tests {
         // UniTask/Runtime/Utils/L.cs vs Zenject/Runtime/Utils/L.cs). The
         // GUID-suffix rule sidesteps the path-based depth-2 ambiguity
         // entirely: alias is intrinsic to the asset (survives `git mv`).
-        let guid = 0x9ddf5ad82f894638a9ba6a59eb87d508_u128;
+        let guid = Guid::from_u128(0x9ddf5ad82f894638a9ba6a59eb87d508_u128);
         assert_eq!(guid_suffix("L", guid), "L^9ddf5ad8");
 
-        let guid_b = 0x3751098bb0c541e296a07628e24fcb84_u128;
+        let guid_b = Guid::from_u128(0x3751098bb0c541e296a07628e24fcb84_u128);
         assert_eq!(guid_suffix("L", guid_b), "L^3751098b");
     }
 
@@ -1366,7 +1366,7 @@ mod tests {
         assert!(msg.contains("Foo"), "msg: {msg}");
     }
 
-    fn raw_native(hint: &str, guid: u128, sub_assets: Vec<SubAsset>) -> RawEntry {
+    fn raw_native(hint: &str, guid: Guid, sub_assets: Vec<SubAsset>) -> RawEntry {
         RawEntry {
             guid,
             asset_type_raw: AssetTypeRaw::Native(ClassId::Texture2D as u32),
@@ -1391,8 +1391,8 @@ mod tests {
     /// suffix.
     #[test]
     fn build_db_renames_every_claimant_when_name_is_contested() {
-        let png_a_guid = 0xa0_u128;
-        let png_b_guid = 0xb0_u128;
+        let png_a_guid = Guid::from_u128(0xa0_u128);
+        let png_b_guid = Guid::from_u128(0xb0_u128);
         let sprite_fid: i64 = 21300000;
 
         let raw = vec![
@@ -1440,9 +1440,9 @@ mod tests {
     /// the shorter form.
     #[test]
     fn build_db_contested_alias_is_independent_of_other_siblings() {
-        let a_guid = 0xa0_u128;
-        let b_guid = 0xb0_u128;
-        let c_guid = 0xc0_u128;
+        let a_guid = Guid::from_u128(0xa0_u128);
+        let b_guid = Guid::from_u128(0xb0_u128);
+        let c_guid = Guid::from_u128(0xc0_u128);
 
         // Two-claimant bake.
         let raw_two = vec![
@@ -1480,8 +1480,8 @@ mod tests {
     /// directory layout, stable under `git mv`.
     #[test]
     fn build_db_uses_guid_suffix_for_contested_monoscripts() {
-        let a_guid = 0x9ddf5ad82f894638a9ba6a59eb87d508_u128;
-        let b_guid = 0x3751098bb0c541e296a07628e24fcb84_u128;
+        let a_guid = Guid::from_u128(0x9ddf5ad82f894638a9ba6a59eb87d508_u128);
+        let b_guid = Guid::from_u128(0x3751098bb0c541e296a07628e24fcb84_u128);
         let raw = vec![
             RawEntry {
                 guid: a_guid,
@@ -1514,8 +1514,8 @@ mod tests {
     /// rename one in source.
     #[test]
     fn build_db_fails_when_two_contestants_share_depth_2_parent() {
-        let a_guid = 0xa0_u128;
-        let b_guid = 0xb0_u128;
+        let a_guid = Guid::from_u128(0xa0_u128);
+        let b_guid = Guid::from_u128(0xb0_u128);
         // Both hints end with `…/X/Y/Foo.png` — depth-2 suffix `X/Y` for both.
         let raw = vec![
             raw_native("Assets/X/Y/Foo.png", a_guid, vec![]),
@@ -1538,8 +1538,8 @@ mod tests {
     /// C# field type to disambiguate cross-kind same-stem cases.
     #[test]
     fn build_db_keeps_bare_alias_for_type_distinct_collisions() {
-        let png_guid = 0xa0_u128;
-        let prefab_guid = 0xb0_u128;
+        let png_guid = Guid::from_u128(0xa0_u128);
+        let prefab_guid = Guid::from_u128(0xb0_u128);
         let raw = vec![
             RawEntry {
                 guid: png_guid,
@@ -1579,8 +1579,8 @@ mod tests {
     #[test]
     fn build_db_skips_controller_embedded_subassets_in_global_pool() {
         const ANIMATOR_STATE_CLASS_ID: u32 = 1102;
-        let controller_guid = 0xc0_u128;
-        let other_state_guid = 0xd0_u128;
+        let controller_guid = Guid::from_u128(0xc0_u128);
+        let other_state_guid = Guid::from_u128(0xd0_u128);
         let raw = vec![
             RawEntry {
                 guid: controller_guid,
@@ -1628,8 +1628,8 @@ mod tests {
     #[test]
     fn build_db_skips_mixer_embedded_subassets_in_global_pool() {
         const AUDIO_MIXER_GROUP_CLASS_ID: u32 = 273;
-        let mixer_guid = 0xe0_u128;
-        let other_group_guid = 0xf0_u128;
+        let mixer_guid = Guid::from_u128(0xe0_u128);
+        let other_group_guid = Guid::from_u128(0xf0_u128);
         let raw = vec![
             RawEntry {
                 guid: mixer_guid,
@@ -1678,9 +1678,9 @@ mod tests {
         // but doesn't validate them against any registry. Extension is
         // the discriminator that triggers the exclusion.
         const ANIMATION_TRACK_CLASS_ID: u32 = 5004;
-        let some_script_guid = 0xd21dcc2386d650c4597f3633c75a1f98_u128;
-        let pa_guid = 0xa0_u128;
-        let pb_guid = 0xb0_u128;
+        let some_script_guid = Guid::from_u128(0xd21dcc2386d650c4597f3633c75a1f98_u128);
+        let pa_guid = Guid::from_u128(0xa0_u128);
+        let pb_guid = Guid::from_u128(0xb0_u128);
         let raw = vec![
             RawEntry {
                 guid: pa_guid,
@@ -1728,8 +1728,8 @@ mod tests {
     /// consumer layer, not the global alias bucket.
     #[test]
     fn build_db_skips_prefab_embedded_subassets_in_global_pool() {
-        let prefab_guid = 0xa0_u128;
-        let other_clip_guid = 0xb0_u128;
+        let prefab_guid = Guid::from_u128(0xa0_u128);
+        let other_clip_guid = Guid::from_u128(0xb0_u128);
         let raw = vec![
             RawEntry {
                 guid: prefab_guid,
@@ -1774,7 +1774,7 @@ mod tests {
     /// case of a Texture2D and its lone same-named Sprite sub-asset.
     #[test]
     fn build_db_keeps_bare_alias_when_name_is_uncontested() {
-        let png_guid = 0xb0_u128;
+        let png_guid = Guid::from_u128(0xb0_u128);
         let raw = vec![raw_native(
             "Assets/Tower/Lone.png",
             png_guid,
@@ -1799,7 +1799,7 @@ mod tests {
     /// alias for the degenerate case.
     #[test]
     fn build_db_keeps_bare_alias_for_extensionless_hint() {
-        let guid = 0x77_u128;
+        let guid = Guid::from_u128(0x77_u128);
         let raw = vec![RawEntry {
             guid,
             asset_type_raw: AssetTypeRaw::Native(ClassId::DefaultAsset as u32),
@@ -1820,7 +1820,7 @@ mod tests {
     /// field type.
     #[test]
     fn build_db_always_appends_ext_to_alias() {
-        let prefab_guid = 0x10_u128;
+        let prefab_guid = Guid::from_u128(0x10_u128);
         let raw = vec![RawEntry {
             guid: prefab_guid,
             asset_type_raw: AssetTypeRaw::Native(ClassId::Prefab as u32),
@@ -1841,11 +1841,11 @@ mod tests {
     /// is unique within its own bucket.
     #[test]
     fn build_db_disambiguates_cross_ext_collision_via_ext_suffix() {
-        let scene_guid = 0x01_u128;
-        let playable_guid = 0x02_u128;
-        let script_guid = 0x03_u128;
-        let prefab_guid = 0x04_u128;
-        let timeline_script_guid = 0xaaaa_u128;
+        let scene_guid = Guid::from_u128(0x01_u128);
+        let playable_guid = Guid::from_u128(0x02_u128);
+        let script_guid = Guid::from_u128(0x03_u128);
+        let prefab_guid = Guid::from_u128(0x04_u128);
+        let timeline_script_guid = Guid::from_u128(0xaaaa_u128);
 
         let raw = vec![
             RawEntry {
@@ -1910,10 +1910,10 @@ mod tests {
     /// extensions alone, no within-ext contention.
     #[test]
     fn build_db_disambiguates_script_typed_cross_ext_via_ext_suffix() {
-        let asset_guid = 0xc7_u128;
-        let playable_guid = 0xed_u128;
-        let installer_script = 0x1111_u128;
-        let timeline_script = 0x2222_u128;
+        let asset_guid = Guid::from_u128(0xc7_u128);
+        let playable_guid = Guid::from_u128(0xed_u128);
+        let installer_script = Guid::from_u128(0x1111_u128);
+        let timeline_script = Guid::from_u128(0x2222_u128);
         let raw = vec![
             RawEntry {
                 guid: asset_guid,
@@ -1961,7 +1961,7 @@ mod tests {
         let raw = vec![
             raw_native(
                 "Assets/20_Contents/ConflictPopup/Screens/1.png",
-                0xa0,
+                Guid::from_u128(0xa0),
                 vec![SubAsset {
                     file_id: sprite_fid,
                     class_id: ClassId::Sprite as u32,
@@ -1970,7 +1970,7 @@ mod tests {
             ),
             raw_native(
                 "Assets/20_Contents/ShopPopup/Screens/1.png",
-                0xb0,
+                Guid::from_u128(0xb0),
                 vec![SubAsset {
                     file_id: sprite_fid,
                     class_id: ClassId::Sprite as u32,
@@ -1981,7 +1981,7 @@ mod tests {
 
         // First bake — contested sub-asset "1" gets depth-2 suffix with `/`.
         let db1 = build_db(raw, None, false).expect("first bake");
-        let a = db1.find_by_guid(0xa0).unwrap();
+        let a = db1.find_by_guid(Guid::from_u128(0xa0)).unwrap();
         assert_eq!(&*a.sub_assets[0].name, "1^ConflictPopup/Screens");
 
         // Round-trip: convert baked entries back to raw and re-build.
@@ -1993,8 +1993,8 @@ mod tests {
         let db2 = build_db(raw2, None, false).expect("round-trip bake must not fail");
 
         // Same result — collision suffixes re-applied identically.
-        let a2 = db2.find_by_guid(0xa0).unwrap();
-        let b2 = db2.find_by_guid(0xb0).unwrap();
+        let a2 = db2.find_by_guid(Guid::from_u128(0xa0)).unwrap();
+        let b2 = db2.find_by_guid(Guid::from_u128(0xb0)).unwrap();
         assert_eq!(&*a2.sub_assets[0].name, "1^ConflictPopup/Screens");
         assert_eq!(&*b2.sub_assets[0].name, "1^ShopPopup/Screens");
     }
@@ -2006,8 +2006,8 @@ mod tests {
             // Two top-level entries with the same `<stem>.<ext>` name and
             // no parent segments to walk — `parent_suffix` has nothing to
             // attach.
-            raw_native("Foo.png", 0x01_u128, vec![]),
-            raw_native("Foo.png", 0x02_u128, vec![]),
+            raw_native("Foo.png", Guid::from_u128(0x01_u128), vec![]),
+            raw_native("Foo.png", Guid::from_u128(0x02_u128), vec![]),
         ];
 
         let err = build_db(raw, None, false)

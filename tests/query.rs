@@ -4,9 +4,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use unity_assetdb::Guid;
 use unity_assetdb::bake::{BakeOptions, bake};
 use unity_assetdb::query::{
-    self, AssetTypeFilter, QueryError, asset_type_str, format_guid, parse_guid,
+    self, AssetTypeFilter, QueryError, asset_type_str, parse_guid,
 };
 
 fn write(path: &Path, body: &str) {
@@ -87,7 +88,7 @@ fn guid_of_path_hits_existing_entry() {
     let db = query::open(&out_dir).unwrap();
 
     let entry = query::guid_of_path(&db, "Assets/UI/Foo.prefab").expect("hit");
-    assert_eq!(entry.guid, 0xaaaa1111aaaa1111aaaa1111aaaa1111_u128);
+    assert_eq!(entry.guid, Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128));
 }
 
 #[test]
@@ -147,14 +148,14 @@ fn path_of_guid_hits_existing_entry() {
     let db = query::open(&out_dir).unwrap();
 
     let entry =
-        query::path_of_guid(&db, 0xaaaa1111aaaa1111aaaa1111aaaa1111_u128).expect("hit");
+        query::path_of_guid(&db, Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)).expect("hit");
     assert_eq!(&*entry.hint, "Assets/UI/Foo.prefab");
 }
 
 #[test]
 fn parse_guid_tolerates_hyphens_and_uppercase() {
     let g = parse_guid("AAAA1111-AAAA1111-AAAA1111-AAAA1111").unwrap();
-    assert_eq!(g, 0xaaaa1111aaaa1111aaaa1111aaaa1111_u128);
+    assert_eq!(g, Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128));
 }
 
 #[test]
@@ -237,7 +238,7 @@ fn list_filters_by_script_guid() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    let script_guid = 0xbbbb2222bbbb2222bbbb2222bbbb2222_u128;
+    let script_guid = Guid::from_u128(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128);
     let scripts: Vec<_> =
         query::list(&db, Some(AssetTypeFilter::Script(script_guid))).collect();
     assert_eq!(scripts.len(), 1);
@@ -252,7 +253,7 @@ fn list_filter_unknown_script_returns_empty() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    let scripts: Vec<_> = query::list(&db, Some(AssetTypeFilter::Script(0x1234_u128))).collect();
+    let scripts: Vec<_> = query::list(&db, Some(AssetTypeFilter::Script(Guid::from_u128(0x1234_u128)))).collect();
     assert!(scripts.is_empty());
 }
 
@@ -290,8 +291,8 @@ fn alias_miss_returns_empty() {
 
 #[test]
 fn format_and_parse_guid_round_trip() {
-    let g = 0xabcd_ef01_2345_6789_abcd_ef01_2345_6789_u128;
-    let s = format_guid(g);
+    let g = Guid::from_u128(0xabcd_ef01_2345_6789_abcd_ef01_2345_6789_u128);
+    let s = g.to_string();
     assert_eq!(s, "abcdef0123456789abcdef0123456789");
     assert_eq!(parse_guid(&s).unwrap(), g);
 }
@@ -304,10 +305,10 @@ fn asset_type_str_formats_native_and_script() {
     let out_dir = bake_at(&root);
     let db = query::open(&out_dir).unwrap();
 
-    let foo = query::path_of_guid(&db, 0xaaaa1111aaaa1111aaaa1111aaaa1111_u128).unwrap();
+    let foo = query::path_of_guid(&db, Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)).unwrap();
     assert_eq!(asset_type_str(foo.asset_type, &db), "Prefab");
 
-    let bar = query::path_of_guid(&db, 0xdddd4444dddd4444dddd4444dddd4444_u128).unwrap();
+    let bar = query::path_of_guid(&db, Guid::from_u128(0xdddd4444dddd4444dddd4444dddd4444_u128)).unwrap();
     let s = asset_type_str(bar.asset_type, &db);
     assert!(s.starts_with("Script:"), "got {s}");
     assert!(s.contains("bbbb2222bbbb2222bbbb2222bbbb2222"));

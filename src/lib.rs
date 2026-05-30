@@ -6,6 +6,7 @@
 //!
 //! ## Modules
 //!
+//! - [`guid`] — the asset GUID newtype ([`Guid`]), the crate's identity key.
 //! - [`store`] — on-disk schema (`AssetDb`, `AssetEntry`, `SubAsset`, `AssetType`).
 //! - [`class_id`] — Unity classID enum.
 //! - [`meta`] — `.meta` parser.
@@ -24,6 +25,7 @@ pub mod asset;
 pub mod bake;
 pub mod builtin;
 pub mod class_id;
+pub mod guid;
 pub mod meta;
 pub mod query;
 pub mod refresh;
@@ -33,6 +35,8 @@ pub mod suggest;
 pub mod usage;
 pub mod walk;
 pub mod watch;
+
+pub use guid::Guid;
 
 #[cfg(test)]
 pub(crate) mod test_support;

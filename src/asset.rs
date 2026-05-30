@@ -12,6 +12,8 @@
 
 use anyhow::Result;
 
+use crate::guid::Guid;
+
 #[derive(Debug, Clone, Default)]
 pub struct AssetInfo {
     /// First doc's class ID. None on a malformed/empty asset.
@@ -19,7 +21,7 @@ pub struct AssetInfo {
     /// First doc's fileID (the `&NNN` after the class ID).
     pub top_file_id: Option<i64>,
     /// `m_Script.guid` for the top doc when it's MonoBehaviour-class (114).
-    pub script_guid: Option<u128>,
+    pub script_guid: Option<Guid>,
     /// Sub-asset docs after the first. `(class_id, file_id, m_Name)`.
     /// `m_Name` is empty when the sub-doc has none — caller decides how to handle.
     pub sub_assets: Vec<SubAssetEntry>,
@@ -57,7 +59,7 @@ pub fn parse(text: &str, mode: ParseMode) -> Result<AssetInfo> {
         class_id: u32,
         file_id: i64,
         name: Option<String>,
-        script_guid: Option<u128>,
+        script_guid: Option<Guid>,
     }
 
     let mut doc_idx: usize = 0;
@@ -151,7 +153,7 @@ fn parse_doc_header(line: &str) -> Option<(u32, i64)> {
 }
 
 /// Pull `guid: <hex32>` out of `{fileID: …, guid: ABC…, type: …}`.
-fn parse_inline_guid(rest: &str) -> Option<u128> {
+fn parse_inline_guid(rest: &str) -> Option<Guid> {
     let s = rest.trim();
     let s = s.trim_start_matches('{').trim_end_matches('}');
     for part in s.split(',') {
@@ -159,7 +161,7 @@ fn parse_inline_guid(rest: &str) -> Option<u128> {
         if let Some(hex) = part.strip_prefix("guid:") {
             let hex = hex.trim();
             if hex.len() == 32 {
-                return u128::from_str_radix(hex, 16).ok();
+                return u128::from_str_radix(hex, 16).ok().map(Guid::from_u128);
             }
         }
     }
@@ -201,7 +203,7 @@ MonoBehaviour:
         assert_eq!(info.top_class_id, Some(114));
         assert_eq!(
             info.script_guid,
-            Some(0x7d602c2080b53413fa393df6b2c0af43_u128)
+            Some(Guid::from_u128(0x7d602c2080b53413fa393df6b2c0af43_u128))
         );
     }
 

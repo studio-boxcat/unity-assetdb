@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use bincode::{Decode, Encode};
 
 use crate::class_id::ClassId;
+use crate::guid::Guid;
 
 /// Bumped whenever the on-disk schema changes incompatibly.
 /// A version mismatch is a hard fail — the user re-bakes.
@@ -58,7 +59,7 @@ pub const MAGIC: [u8; 8] = *b"UADBIN__";
 ///
 /// `Native(classId)` for built-in types (Sprite, Prefab, Texture2D, …).
 /// `Script(idx)` for MonoBehaviour-backed assets — `idx` indexes into
-/// [`AssetDb::script_types`], whose entries are u128 script GUIDs that
+/// [`AssetDb::script_types`], whose entries are script GUIDs that
 /// match the `guid` field of the corresponding `.cs.meta`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum AssetType {
@@ -103,7 +104,7 @@ pub struct SubAsset {
 /// field a `String` carries for growability).
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct AssetEntry {
-    pub guid: u128,
+    pub guid: Guid,
     pub asset_type: AssetType,
     pub name: Box<str>,
     pub sub_assets: Vec<SubAsset>,
@@ -128,9 +129,9 @@ pub struct AssetDb {
     /// Kept opaque per the Watchman protocol — we never parse the
     /// inside. See [docs/refresh.md](../../docs/refresh.md).
     pub watchman_clock: Option<String>,
-    /// Interned script GUIDs (u128). `AssetType::Script(idx)` indexes here.
+    /// Interned script GUIDs. `AssetType::Script(idx)` indexes here.
     /// Sorted ascending; deduplicated.
-    pub script_types: Vec<u128>,
+    pub script_types: Vec<Guid>,
     /// Sorted by `guid` ascending.
     pub entries: Vec<AssetEntry>,
 }
@@ -144,7 +145,7 @@ impl AssetDb {
     }
 
     /// O(log n) lookup by GUID. None if absent.
-    pub fn find_by_guid(&self, guid: u128) -> Option<&AssetEntry> {
+    pub fn find_by_guid(&self, guid: Guid) -> Option<&AssetEntry> {
         let idx = self.entries.binary_search_by_key(&guid, |e| e.guid).ok()?;
         Some(&self.entries[idx])
     }
@@ -170,7 +171,7 @@ impl AssetDb {
 
     /// Resolve `AssetType::Script(idx)` to its underlying script GUID.
     /// Panics on out-of-range idx — that's a corrupt-file error, fail loud.
-    pub fn script_guid(&self, idx: u32) -> u128 {
+    pub fn script_guid(&self, idx: u32) -> Guid {
         self.script_types[idx as usize]
     }
 
@@ -179,7 +180,7 @@ impl AssetDb {
     /// stay valid. Bake's hot path has `entries.is_empty()`, so the
     /// remap is a no-op there; register relies on it to keep an
     /// incremental update coherent.
-    pub fn intern_script(&mut self, guid: u128) -> u32 {
+    pub fn intern_script(&mut self, guid: Guid) -> u32 {
         match self.script_types.binary_search(&guid) {
             Ok(idx) => idx as u32,
             Err(idx) => {
@@ -467,17 +468,17 @@ mod tests {
     #[test]
     fn roundtrip_with_entries() {
         let mut db = AssetDb::new();
-        let script_guid = 0x1234_5678_9abc_def0_1122_3344_5566_7788_u128;
+        let script_guid = Guid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788_u128);
         let idx = db.intern_script(script_guid);
         db.entries.push(AssetEntry {
-            guid: 0xaabb_ccdd_u128,
+            guid: Guid::from_u128(0xaabb_ccdd_u128),
             asset_type: AssetType::native(ClassId::Prefab),
             name: "Foo".into(),
             sub_assets: vec![],
             hint: "Assets/UI/Foo.prefab".into(),
         });
         db.entries.push(AssetEntry {
-            guid: 0x1111_2222_u128,
+            guid: Guid::from_u128(0x1111_2222_u128),
             asset_type: AssetType::Script(idx),
             name: "Bar".into(),
             sub_assets: vec![SubAsset {
@@ -493,15 +494,15 @@ mod tests {
         let back = decode(&bytes).unwrap();
         assert_eq!(back.script_types, vec![script_guid]);
         assert_eq!(back.entries.len(), 2);
-        assert_eq!(back.entries[0].guid, 0x1111_2222_u128);
-        assert_eq!(&*back.find_by_guid(0xaabb_ccdd_u128).unwrap().name, "Foo");
-        assert!(back.find_by_guid(0xdead_beef_u128).is_none());
+        assert_eq!(back.entries[0].guid, Guid::from_u128(0x1111_2222_u128));
+        assert_eq!(&*back.find_by_guid(Guid::from_u128(0xaabb_ccdd_u128)).unwrap().name, "Foo");
+        assert!(back.find_by_guid(Guid::from_u128(0xdead_beef_u128)).is_none());
     }
 
     #[test]
     fn intern_dedups() {
         let mut db = AssetDb::new();
-        let g = 42u128;
+        let g = Guid::from_u128(42u128);
         let a = db.intern_script(g);
         let b = db.intern_script(g);
         assert_eq!(a, b);
@@ -612,7 +613,7 @@ mod tests {
     fn subasset_class_id_round_trips() {
         let mut db = AssetDb::new();
         db.entries.push(AssetEntry {
-            guid: 0xa0_u128,
+            guid: Guid::from_u128(0xa0_u128),
             asset_type: AssetType::native(ClassId::AnimatorController),
             name: "Foo".into(),
             sub_assets: vec![
@@ -633,7 +634,7 @@ mod tests {
 
         let bytes = encode(&db).unwrap();
         let back = decode(&bytes).unwrap();
-        let entry = back.find_by_guid(0xa0_u128).unwrap();
+        let entry = back.find_by_guid(Guid::from_u128(0xa0_u128)).unwrap();
         assert_eq!(entry.sub_assets.len(), 2);
         let self_sub = entry
             .sub_assets

@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::bake::{self, BakeError, BakeOptions, RawEntry, raw_from_entry};
+use crate::guid::Guid;
 use crate::store::{self, AssetDb, StoreError};
 use crate::watch::{self, Delta, WatchError};
 
@@ -163,11 +164,11 @@ pub(crate) fn patch(
     // the old-hint deletion (without it two rows could share a GUID).
     let touched_hints: ahash::AHashSet<&str> =
         parsed.iter().map(|(h, _)| h.as_str()).collect();
-    let new_guids: ahash::AHashSet<u128> = parsed
+    let new_guids: ahash::AHashSet<Guid> = parsed
         .iter()
         .filter_map(|(_, r)| r.as_ref().map(|raw| raw.guid))
         .collect();
-    let mut to_drop_guids: ahash::AHashSet<u128> = ahash::AHashSet::new();
+    let mut to_drop_guids: ahash::AHashSet<Guid> = ahash::AHashSet::new();
     for entry in &db.entries {
         if touched_hints.contains(entry.hint.as_ref())
             || new_guids.contains(&entry.guid)
@@ -259,7 +260,7 @@ mod tests {
 
         assert_eq!(db.entries.len(), initial_len + 1);
         assert!(
-            db.find_by_guid(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128)
+            db.find_by_guid(Guid::from_u128(0xbbbb2222bbbb2222bbbb2222bbbb2222_u128))
                 .is_some(),
             "new Bar.asset not patched in",
         );
@@ -279,7 +280,7 @@ mod tests {
         // synthesize a small modification: append a no-op line. The
         // GUID stays, but the parse re-runs.
         let original_guid = db
-            .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
             .expect("Foo must exist")
             .guid;
         fs::write(
@@ -303,7 +304,7 @@ mod tests {
         fixture(&root);
         let mut db = bake_fresh(&root);
         assert!(
-            db.find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            db.find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
                 .is_some(),
             "Foo must exist before delete",
         );
@@ -314,7 +315,7 @@ mod tests {
         patch(&mut db, &root, &["Assets/UI/Foo.prefab".to_owned()]).unwrap();
 
         assert!(
-            db.find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            db.find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
                 .is_none(),
             "Foo entry should be dropped after delete",
         );
@@ -355,14 +356,14 @@ mod tests {
         .unwrap();
 
         let entry = db
-            .find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
             .expect("rename preserves GUID");
         assert_eq!(&*entry.hint, "Assets/Moved/Foo.prefab");
         // Pin "no duplicates": only ONE entry carries this GUID.
         let count = db
             .entries
             .iter()
-            .filter(|e| e.guid == 0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .filter(|e| e.guid == Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
             .count();
         assert_eq!(count, 1);
         fs::remove_dir_all(&root).ok();
@@ -390,7 +391,7 @@ mod tests {
 
         // db unchanged.
         assert!(
-            db.find_by_guid(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            db.find_by_guid(Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
                 .is_some(),
         );
         fs::remove_dir_all(&root).ok();
@@ -440,7 +441,7 @@ mod tests {
         let count = db
             .entries
             .iter()
-            .filter(|e| e.guid == 0xaaaa1111aaaa1111aaaa1111aaaa1111_u128)
+            .filter(|e| e.guid == Guid::from_u128(0xaaaa1111aaaa1111aaaa1111aaaa1111_u128))
             .count();
         assert_eq!(count, 1);
         fs::remove_dir_all(&root).ok();

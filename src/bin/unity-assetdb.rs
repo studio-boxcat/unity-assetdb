@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use unity_assetdb::Guid;
 use unity_assetdb::bake::{BakeOptions, bake};
 use unity_assetdb::query::{self, AssetTypeFilter, QueryError, parse_guid};
 use unity_assetdb::refresh;
@@ -476,9 +477,9 @@ fn write_row(
 /// Format a `u128` as 32 lowercase hex bytes. Bypasses `std::fmt::write`
 /// — the formatter trait dispatch is ~17% of the per-row write cost on
 /// `list` emit (bench in `examples/bench_list.rs`).
-pub(crate) fn u128_hex(v: u128) -> [u8; 32] {
+pub(crate) fn u128_hex(v: Guid) -> [u8; 32] {
     const LUT: &[u8; 16] = b"0123456789abcdef";
-    let bytes = v.to_be_bytes();
+    let bytes = v.as_u128().to_be_bytes();
     let mut out = [0u8; 32];
     for (i, b) in bytes.iter().enumerate() {
         out[i * 2] = LUT[(b >> 4) as usize];

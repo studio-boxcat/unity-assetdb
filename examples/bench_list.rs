@@ -6,6 +6,7 @@ use std::hint::black_box;
 use std::io::Write;
 use std::time::Instant;
 
+use unity_assetdb::Guid;
 use unity_assetdb::class_id::ClassId;
 use unity_assetdb::store::{self, AssetDb, AssetType};
 
@@ -63,7 +64,7 @@ fn main() {
         || {
             let mut acc: u64 = 0;
             for e in db.entries.iter() {
-                acc = acc.wrapping_add(e.guid as u64);
+                acc = acc.wrapping_add(e.guid.as_u128() as u64);
                 acc = acc.wrapping_add(e.name.len() as u64);
             }
             black_box(acc);
@@ -126,9 +127,9 @@ fn main() {
 
 /// Specialized hex encoder — bypasses `std::fmt::write` for the 32-char
 /// GUID column. Writes directly to a stack buffer then `write_all`.
-fn u128_hex_bytes(v: u128) -> [u8; 32] {
+fn u128_hex_bytes(v: Guid) -> [u8; 32] {
     const LUT: &[u8; 16] = b"0123456789abcdef";
-    let bytes = v.to_be_bytes();
+    let bytes = v.as_u128().to_be_bytes();
     let mut out = [0u8; 32];
     for (i, b) in bytes.iter().enumerate() {
         out[i * 2] = LUT[(b >> 4) as usize];
@@ -160,7 +161,7 @@ fn write_row_fast<W: Write>(w: &mut W, e: &unity_assetdb::store::AssetEntry, db:
 }
 
 fn write_row<W: Write>(w: &mut W, e: &unity_assetdb::store::AssetEntry, db: &AssetDb) -> std::io::Result<()> {
-    write!(w, "{:032x}\t", e.guid)?;
+    write!(w, "{}\t", e.guid)?;
     write_tsv_escaped(w, &e.name)?;
     w.write_all(b"\t")?;
     match e.asset_type {
@@ -168,7 +169,7 @@ fn write_row<W: Write>(w: &mut W, e: &unity_assetdb::store::AssetEntry, db: &Ass
             Some(c) => w.write_all(c.name().as_bytes())?,
             None => write!(w, "Native:{n}")?,
         },
-        AssetType::Script(idx) => write!(w, "Script:{:032x}", db.script_guid(idx))?,
+        AssetType::Script(idx) => write!(w, "Script:{}", db.script_guid(idx))?,
     }
     w.write_all(b"\t")?;
     write_tsv_escaped(w, &e.hint)?;

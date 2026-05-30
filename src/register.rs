@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::bake::{self, BakeError, ParsedAssetType, ParsedEntry};
-use crate::query;
+use crate::guid::Guid;
 use crate::store::{self, AssetDb, AssetEntry, AssetType, LockWait, StoreError};
 
 /// Unity importer kind. Each variant maps to the YAML block key (e.g.
@@ -141,10 +141,10 @@ pub fn render_meta(guid_hex: &str, kind: ImporterKind, is_folder: bool) -> Strin
 /// Generate a fresh 128-bit GUID via the OS RNG. 32-char lowercase hex.
 /// 128-bit random is collision-safe at any realistic project scale —
 /// no in-db collision check.
-pub fn generate_guid() -> Result<u128, RegisterError> {
+pub fn generate_guid() -> Result<Guid, RegisterError> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).map_err(RegisterError::Rand)?;
-    Ok(u128::from_be_bytes(buf))
+    Ok(Guid::from_u128(u128::from_be_bytes(buf)))
 }
 
 /// Errors from a `register` run.
@@ -202,7 +202,7 @@ pub struct RegisterOptions {
 #[derive(Debug, Clone, Copy)]
 pub struct RegisterOutcome {
     /// The asset's GUID after the operation (newly minted or pre-existing).
-    pub guid: u128,
+    pub guid: Guid,
     /// `true` when this call synthesized the `.meta` (idempotent re-runs
     /// return `false`).
     pub created_meta: bool,
@@ -272,7 +272,7 @@ fn synthesize_or_read_meta(
     target_abs: &Path,
     meta_path: &Path,
     opts: &RegisterOptions,
-) -> Result<(u128, bool), RegisterError> {
+) -> Result<(Guid, bool), RegisterError> {
     let is_dir = std::fs::metadata(target_abs)
         .map(|m| m.is_dir())
         .unwrap_or(false);
@@ -280,7 +280,7 @@ fn synthesize_or_read_meta(
         .importer_override
         .unwrap_or_else(|| importer_for_path(target_abs, is_dir));
     let guid = generate_guid()?;
-    let hex = query::format_guid(guid);
+    let hex = guid.to_string();
     let body = render_meta(&hex, kind, is_dir);
     match std::fs::OpenOptions::new()
         .write(true)
@@ -313,7 +313,7 @@ fn synthesize_or_read_meta(
 fn parse_existing_meta(
     meta_path: &Path,
     importer_override: Option<ImporterKind>,
-) -> Result<u128, RegisterError> {
+) -> Result<Guid, RegisterError> {
     let text = std::fs::read_to_string(meta_path).map_err(|source| RegisterError::Io {
         op: "read meta",
         path: meta_path.to_path_buf(),
@@ -537,6 +537,6 @@ mod tests {
         let a = generate_guid().unwrap();
         let b = generate_guid().unwrap();
         assert_ne!(a, b);
-        assert_ne!(a, 0);
+        assert_ne!(a, Guid::from_u128(0));
     }
 }

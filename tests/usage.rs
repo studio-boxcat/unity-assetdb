@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use unity_assetdb::Guid;
 use unity_assetdb::bake::{BakeOptions, bake};
 use unity_assetdb::query;
 use unity_assetdb::usage::{UsageMatch, find_usages};
@@ -22,8 +23,8 @@ fn target_hex() -> &'static [u8; 32] {
     TARGET_HEX_STR.as_bytes().try_into().unwrap()
 }
 
-fn target_guid() -> u128 {
-    u128::from_str_radix(TARGET_HEX_STR, 16).unwrap()
+fn target_guid() -> Guid {
+    Guid::from_u128(u128::from_str_radix(TARGET_HEX_STR, 16).unwrap())
 }
 
 fn write(path: &Path, body: &str) {
@@ -316,7 +317,7 @@ fn path_resolves_via_bake_then_walks_to_real_refs() {
     let entry = query::guid_of_path(&db, "Assets/Scripts/Card.cs").expect("entry baked");
     assert_eq!(entry.guid, target_guid());
 
-    let hex_owned = query::format_guid(entry.guid);
+    let hex_owned = entry.guid.to_string();
     let hex_bytes: &[u8; 32] = hex_owned.as_bytes().try_into().unwrap();
     let hits = find_usages(&root, hex_bytes).unwrap();
     let paths: Vec<_> = hits.iter().map(rel).collect();

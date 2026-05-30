@@ -17,6 +17,7 @@
 //! plus `usage <path>`) feed [`crate::suggest`].
 
 use crate::class_id::ClassId;
+use crate::guid::Guid;
 use crate::store::{self, AssetDb, AssetEntry, AssetType, StoreError, SubAsset};
 use std::path::Path;
 
@@ -61,7 +62,7 @@ pub fn normalize_hint(s: &str) -> String {
 }
 
 /// GUID → top-level entry.
-pub fn path_of_guid(db: &AssetDb, guid: u128) -> Option<&AssetEntry> {
+pub fn path_of_guid(db: &AssetDb, guid: Guid) -> Option<&AssetEntry> {
     db.find_by_guid(guid)
 }
 
@@ -117,7 +118,7 @@ pub enum AssetTypeFilter {
     Native(u32),
     /// Script-backed type, keyed by the script's GUID. Resolves to
     /// `AssetType::Script(idx)` once mapped against `db.script_types`.
-    Script(u128),
+    Script(Guid),
 }
 
 impl AssetTypeFilter {
@@ -180,7 +181,7 @@ pub fn alias<'a>(db: &'a AssetDb, name: &str) -> Vec<&'a AssetEntry> {
 /// Forward complement to the `AssetEntry.sub_assets` reverse-by-name
 /// surface; consumers (e.g. prefab-YAML converters) want
 /// `(parent, fileID)` resolution on the hot path.
-pub fn find_sub_asset(db: &AssetDb, guid: u128, file_id: i64) -> Option<&SubAsset> {
+pub fn find_sub_asset(db: &AssetDb, guid: Guid, file_id: i64) -> Option<&SubAsset> {
     let entry = db.find_by_guid(guid)?;
     entry.sub_assets.iter().find(|s| s.file_id == file_id)
 }
@@ -189,7 +190,7 @@ pub fn find_sub_asset(db: &AssetDb, guid: u128, file_id: i64) -> Option<&SubAsse
 /// guid is unknown or the entry has no sub-assets. Use when the caller
 /// wants to scan or filter the whole sub-asset list (the
 /// `entry.sub_assets.iter()` path is open-coded otherwise).
-pub fn sub_assets_by_guid_iter(db: &AssetDb, guid: u128) -> impl Iterator<Item = &SubAsset> {
+pub fn sub_assets_by_guid_iter(db: &AssetDb, guid: Guid) -> impl Iterator<Item = &SubAsset> {
     db.find_by_guid(guid)
         .map(|e| e.sub_assets.as_slice())
         .unwrap_or(&[])
@@ -198,21 +199,16 @@ pub fn sub_assets_by_guid_iter(db: &AssetDb, guid: u128) -> impl Iterator<Item =
 
 /// Parse a 32-hex GUID. Hyphens and uppercase tolerated. Fast path for
 /// the no-hyphen common case skips the strip-allocation.
-pub fn parse_guid(s: &str) -> Result<u128, QueryError> {
+pub fn parse_guid(s: &str) -> Result<Guid, QueryError> {
     let bad = || QueryError::BadGuidHex(s.to_owned());
     if s.len() == 32 && !s.contains('-') {
-        return u128::from_str_radix(s, 16).map_err(|_| bad());
+        return u128::from_str_radix(s, 16).map(Guid::from_u128).map_err(|_| bad());
     }
     let cleaned: String = s.chars().filter(|c| *c != '-').collect();
     if cleaned.len() != 32 {
         return Err(bad());
     }
-    u128::from_str_radix(&cleaned, 16).map_err(|_| bad())
-}
-
-/// Format a `u128` GUID as 32-char lowercase hex.
-pub fn format_guid(g: u128) -> String {
-    format!("{g:032x}")
+    u128::from_str_radix(&cleaned, 16).map(Guid::from_u128).map_err(|_| bad())
 }
 
 /// Render `AssetType` as a human-readable string for output rows.
@@ -224,7 +220,7 @@ pub fn asset_type_str(t: AssetType, db: &AssetDb) -> String {
             Some(c) => c.name().to_owned(),
             None => format!("Native:{n}"),
         },
-        AssetType::Script(idx) => format!("Script:{}", format_guid(db.script_guid(idx))),
+        AssetType::Script(idx) => format!("Script:{}", db.script_guid(idx)),
     }
 }
 
@@ -236,7 +232,7 @@ mod tests {
     fn db_with_sub_assets() -> AssetDb {
         let mut db = AssetDb::new();
         db.entries.push(AssetEntry {
-            guid: 0xaabb_u128,
+            guid: Guid::from_u128(0xaabb_u128),
             asset_type: AssetType::native(ClassId::Texture2D),
             name: "Sheet".into(),
             sub_assets: vec![
@@ -260,7 +256,7 @@ mod tests {
     #[test]
     fn find_sub_asset_returns_matching_row() {
         let db = db_with_sub_assets();
-        let s = find_sub_asset(&db, 0xaabb_u128, 21300002).unwrap();
+        let s = find_sub_asset(&db, Guid::from_u128(0xaabb_u128), 21300002).unwrap();
         assert_eq!(&*s.name, "spr_b");
         assert_eq!(s.class_id, ClassId::Sprite as u32);
     }
@@ -268,19 +264,19 @@ mod tests {
     #[test]
     fn find_sub_asset_misses_unknown_guid() {
         let db = db_with_sub_assets();
-        assert!(find_sub_asset(&db, 0xdead_u128, 21300000).is_none());
+        assert!(find_sub_asset(&db, Guid::from_u128(0xdead_u128), 21300000).is_none());
     }
 
     #[test]
     fn find_sub_asset_misses_unknown_file_id() {
         let db = db_with_sub_assets();
-        assert!(find_sub_asset(&db, 0xaabb_u128, 99999999).is_none());
+        assert!(find_sub_asset(&db, Guid::from_u128(0xaabb_u128), 99999999).is_none());
     }
 
     #[test]
     fn sub_assets_by_guid_iter_yields_in_order() {
         let db = db_with_sub_assets();
-        let names: Vec<&str> = sub_assets_by_guid_iter(&db, 0xaabb_u128)
+        let names: Vec<&str> = sub_assets_by_guid_iter(&db, Guid::from_u128(0xaabb_u128))
             .map(|s| &*s.name)
             .collect();
         assert_eq!(names, vec!["spr_a", "spr_b"]);
@@ -289,13 +285,13 @@ mod tests {
     #[test]
     fn sub_assets_by_guid_iter_unknown_guid_is_empty() {
         let db = db_with_sub_assets();
-        assert_eq!(sub_assets_by_guid_iter(&db, 0xdead_u128).count(), 0);
+        assert_eq!(sub_assets_by_guid_iter(&db, Guid::from_u128(0xdead_u128)).count(), 0);
     }
 
     #[test]
     fn parse_guid_accepts_lowercase_uppercase_hyphens() {
         let g = parse_guid("aabbccdd-aabbccdd-aabbccdd-aabbccdd").unwrap();
-        assert_eq!(g, 0xaabbccddaabbccddaabbccddaabbccdd_u128);
+        assert_eq!(g, Guid::from_u128(0xaabbccddaabbccddaabbccddaabbccdd_u128));
         let g2 = parse_guid("AABBCCDDAABBCCDDAABBCCDDAABBCCDD").unwrap();
         assert_eq!(g, g2);
     }
@@ -318,7 +314,7 @@ mod tests {
             AssetTypeFilter::Native(213)
         ));
         match AssetTypeFilter::parse("Script:aabbccddaabbccddaabbccddaabbccdd").unwrap() {
-            AssetTypeFilter::Script(g) => assert_eq!(g, 0xaabbccddaabbccddaabbccddaabbccdd_u128),
+            AssetTypeFilter::Script(g) => assert_eq!(g, Guid::from_u128(0xaabbccddaabbccddaabbccddaabbccdd_u128)),
             _ => panic!(),
         }
     }
